@@ -7,153 +7,182 @@ namespace KaririCode\WebSocket\Connection;
 use KaririCode\WebSocket\Contract\Connection;
 use KaririCode\WebSocket\Enum\CloseCode;
 use KaririCode\WebSocket\Enum\ConnectionState;
+use KaririCode\WebSocket\Enum\Opcode;
+use KaririCode\WebSocket\Exception\ConnectionException;
 use KaririCode\WebSocket\Frame\Frame;
 use KaririCode\WebSocket\Frame\FrameWriter;
+use KaririCode\WebSocket\Handshake\HandshakeRequest;
 use KaririCode\WebSocket\Message\Message;
 
 /**
- * Wraps a raw TCP socket as a WebSocket connection (RFC 6455 §7.1).
+ * The server's connection object: what the handshake established, the
+ * state of the closing handshake, and an outbox of encoded frames. send(),
+ * ping() and close() only queue bytes; the server writes them when the
+ * socket can take them, so a slow client never blocks the event loop and
+ * a partial write never loses a frame. Once a Close frame is queued
+ * nothing else is, as RFC 6455 §5.5.1 asks.
  *
- * ARFA 1.3 P1: constructor parameters (id, address, path, writer) are
- * readonly — immutable once established. The mutable fields (state,
- * metadata, socket) are inherent to the connection lifecycle and exempt
- * from immutability per Spec V4.0 §2.2 (resource-owning types).
+ * ARFA 1.3: P2 (Message → frames → outbox). Spec V4.3.3: final; mutable
+ * by nature (connection state), encapsulated.
  *
- * Spec V4.0: final class. Manages the connection FSM
- * (Connecting → Open → Closing → Closed) and serializes outbound
- * frames via {@see FrameWriter}. The socket resource is owned by
- * this instance and closed on disconnect.
+ * Preconditions: as Connection. takeOutput(), respondToClose(), pong()
+ * and markClosed() belong to the server's session.
  *
- * transitionTo() is package-internal (used by {@see WebSocketServer}
- * during handshake). Application code uses send() and close() only.
+ * Thread-safety: holds the state of one connection; use it from the event
+ * loop only.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5 Data Framing
+ * Side effects: none; the server performs the I/O.
+ *
+ * Example:
+ *
+ *     $connection->send(Message::text('hello'));
+ *     $bytes = $connection->takeOutput();   // "\x81\x05hello", for the socket
+ *
+ * References: RFC 6455 §5.5.1, §5.5.2, §5.5.3, §7.1.2; ADR-002.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-5.5.1
  */
 final class WebSocketConnection implements Connection
 {
     private ConnectionState $state = ConnectionState::Open;
 
-    /** @var array<string, mixed> */
-    private array $metadata = [];
+    private string $outbox = '';
 
-    /**
-     * @param resource $socket  TCP socket resource
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5 Data Framing
-     */
+    /** @var array<string, mixed> */
+    private array $attributes = [];
+
+    private readonly FrameWriter $writer;
+
     public function __construct(
-        private readonly string $connectionId,
-        private $socket,
+        private readonly string $id,
         private readonly string $remoteAddress,
-        private readonly string $requestPath,
-        private readonly FrameWriter $writer,
+        private readonly HandshakeRequest $request,
+        private readonly ?string $subprotocol = null,
     ) {
+        $this->writer = new FrameWriter();
     }
 
-    // ── Connection Contract ──────────────────────────────────────────────
-
+    #[\Override]
     public function id(): string
     {
-        return $this->connectionId;
+        return $this->id;
     }
 
+    #[\Override]
     public function state(): ConnectionState
     {
         return $this->state;
     }
 
+    #[\Override]
     public function remoteAddress(): string
     {
         return $this->remoteAddress;
     }
 
+    #[\Override]
+    public function request(): HandshakeRequest
+    {
+        return $this->request;
+    }
+
+    #[\Override]
     public function path(): string
     {
-        return $this->requestPath;
+        return $this->request->path();
     }
 
+    #[\Override]
+    public function subprotocol(): ?string
+    {
+        return $this->subprotocol;
+    }
+
+    #[\Override]
     public function send(Message $message): void
     {
-        if (!$this->state->canSendData()) {
-            throw new \RuntimeException(
-                "Cannot send data in {$this->state->name} state",
-            );
-        }
-
-        $frame = new Frame(
-            fin: true,
-            opcode: $message->opcode,
-            payload: $message->payload,
-        );
-
-        $this->writeFrame($frame);
+        $this->queue(new Frame(true, $message->opcode, $message->payload));
     }
 
-    public function close(CloseCode $code = CloseCode::NormalClosure, string $reason = ''): void
+    #[\Override]
+    public function ping(string $payload = ''): void
     {
-        if ($this->state->isTerminal()) {
-            return;
-        }
+        $this->queue(Frame::ping($payload));
+    }
+
+    #[\Override]
+    public function close(CloseCode|int $code = CloseCode::NormalClosure, string $reason = ''): void
+    {
+        $frame = Frame::close($code, $reason);
 
         if ($this->state === ConnectionState::Open) {
+            $this->outbox .= $this->writer->write($frame);
             $this->state = ConnectionState::Closing;
-
-            if ($code->isSendable()) {
-                $this->writeFrame(Frame::close($code->numericCode(), $reason));
-            }
         }
-
-        $this->disconnect();
     }
 
-    public function metadata(): array
+    #[\Override]
+    public function attribute(string $name, mixed $default = null): mixed
     {
-        return $this->metadata;
+        return array_key_exists($name, $this->attributes) ? $this->attributes[$name] : $default;
     }
 
-    public function setMetadata(string $key, mixed $value): void
+    #[\Override]
+    public function putAttribute(string $name, mixed $value): void
     {
-        $this->metadata[$key] = $value;
+        $this->attributes[$name] = $value;
     }
 
-    // ── Internal ─────────────────────────────────────────────────────────
-
-    public function writeFrame(Frame $frame): void
+    /**
+     * @return array<string, mixed>
+     */
+    #[\Override]
+    public function attributes(): array
     {
-        if (!is_resource($this->socket)) {
-            return;
-        }
+        return $this->attributes;
+    }
 
-        $data = $this->writer->write($frame);
-        $written = @fwrite($this->socket, $data);
+    /** The queued bytes, removed from the outbox. */
+    public function takeOutput(): string
+    {
+        $output = $this->outbox;
+        $this->outbox = '';
 
-        if ($written === false) {
-            $this->disconnect();
+        return $output;
+    }
+
+    /** Answers a ping with the same payload (RFC 6455 §5.5.3); nothing once closing. */
+    public function pong(string $payload): void
+    {
+        if ($this->state === ConnectionState::Open) {
+            $this->outbox .= $this->writer->write(Frame::pong($payload));
         }
     }
 
     /**
-     * @return resource|null
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5 Data Framing
+     * Answers the client's Close by echoing its code, or an empty Close
+     * when it sent none (RFC 6455 §5.5.1); nothing when the server already
+     * sent its own.
      */
-    public function socket()
+    public function respondToClose(?int $code): void
     {
-        return is_resource($this->socket) ? $this->socket : null;
-    }
-
-    public function disconnect(): void
-    {
-        $this->state = ConnectionState::Closed;
-
-        if (is_resource($this->socket)) {
-            @fclose($this->socket);
+        if ($this->state === ConnectionState::Open) {
+            $this->outbox .= $this->writer->write(new Frame(true, Opcode::Close, $code === null ? '' : pack('n', $code)));
+            $this->state = ConnectionState::Closing;
         }
     }
 
-    public function transitionTo(ConnectionState $state): void
+    public function markClosed(): void
     {
-        $this->state = $state;
+        $this->state = ConnectionState::Closed;
+    }
+
+    private function queue(Frame $frame): void
+    {
+        if (!$this->state->canSend()) {
+            throw ConnectionException::notOpen();
+        }
+
+        $this->outbox .= $this->writer->write($frame);
     }
 }
-

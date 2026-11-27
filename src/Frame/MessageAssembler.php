@@ -4,136 +4,108 @@ declare(strict_types=1);
 
 namespace KaririCode\WebSocket\Frame;
 
-use KaririCode\WebSocket\Enum\CloseCode;
 use KaririCode\WebSocket\Enum\Opcode;
 use KaririCode\WebSocket\Exception\FrameException;
-use KaririCode\WebSocket\Exception\WebSocketException;
+use KaririCode\WebSocket\Exception\InvalidConfigurationException;
+use KaririCode\WebSocket\Exception\InvalidMessageException;
 use KaririCode\WebSocket\Message\Message;
 
 /**
- * Reassembles fragmented data frames into complete {@see Message} objects.
+ * Joins the data frames of one connection into messages (RFC 6455 §5.4):
+ * a text or binary frame starts a message, continuation frames extend it,
+ * the frame with FIN ends it. A continuation without a message, a new
+ * message inside one and a message above the limit fail with the close
+ * code to send; a text message is checked as UTF-8 once it is whole.
+ * Control frames may arrive between fragments, but they are handled by the
+ * caller and never fed here.
  *
- * ARFA 1.3 P2 (Reactive Flow Composition): second stage of the server's
- * data pipeline — {@see FrameParser} → this assembler → handler. Consumes
- * immutable Frame objects and produces immutable Message objects.
+ * ARFA 1.3: P2 (Frame → Message, the second stage of the read path).
+ * Spec V4.3.3: final; one instance per connection, whose only state is
+ * the message being assembled.
  *
- * Spec V4.0: final class. One assembler instance per connection;
- * state is scoped to the current fragmented message only.
+ * Preconditions: $maxMessageSize ≥ 1 (InvalidConfigurationException
+ * 1860). feed() takes data frames only (InvalidMessageException 1845).
  *
- * RFC 6455 §5.4: a message may be split across multiple frames.
- * The first frame carries the actual opcode (Text/Binary), followed
- * by zero or more Continuation frames. The final frame has FIN=1.
+ * Thread-safety: holds the state of one connection; use it from one fiber
+ * at a time.
  *
- * Control frames (Ping/Pong/Close) may interleave within a
- * fragmented message — they are returned immediately without
- * affecting the reassembly state (RFC 6455 §5.4, last paragraph).
+ * Side effects: none.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.4 Fragmentation
+ * Example:
+ *
+ *     $message = $assembler->feed($frame);   // null until the final fragment
+ *     if ($message !== null) {
+ *         $handler->onMessage($connection, $message);
+ *     }
+ *
+ * References: RFC 6455 §5.4 (fragmentation), §5.6 (data frames), §8.1
+ * (UTF-8), §10.4 (limits); ADR-001.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-5.4
  */
 final class MessageAssembler
 {
-    private ?Opcode $fragmentOpcode = null;
-    private string $fragmentBuffer = '';
+    private ?Opcode $opcode = null;
+
+    private string $buffer = '';
 
     public function __construct(
-        private readonly int $maxMessageSize = 10_485_760,
+        public readonly int $maxMessageSize = 10_485_760,
     ) {
+        if ($maxMessageSize < 1) {
+            throw InvalidConfigurationException::nonPositiveLimit('maxMessageSize');
+        }
     }
 
-    /**
-     * Feeds a parsed frame into the assembler.
-     *
-     * Returns a complete Message when the final frame is received,
-     * or null if more frames are needed.
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.4 Fragmentation
-     */
     public function feed(Frame $frame): ?Message
     {
-        // Control frames bypass the reassembly state
         if ($frame->opcode->isControl()) {
-            return new Message($frame->opcode, $frame->payload);
+            throw InvalidMessageException::controlOpcodeInMessage();
         }
 
-        // Start of a new message
-        if ($frame->opcode !== Opcode::Continuation) {
-            if ($this->fragmentOpcode !== null) {
-                throw new WebSocketException(
-                    CloseCode::ProtocolError,
-                    'New data frame received while previous message is incomplete',
-                );
-            }
+        $continuation = $frame->opcode === Opcode::Continuation;
 
-            if ($frame->fin) {
-                // Single-frame message — validate and return
-                $this->validateTextPayload($frame->opcode, $frame->payload);
-
-                return new Message($frame->opcode, $frame->payload);
-            }
-
-            // Begin fragmented message
-            $this->fragmentOpcode = $frame->opcode;
-            $this->fragmentBuffer = $frame->payload;
-            $this->validateBufferSize();
-
-            return null;
+        if ($continuation === ($this->opcode === null)) {
+            throw $continuation ? FrameException::unexpectedContinuation() : FrameException::interleavedDataFrame();
         }
 
-        // Continuation frame — must have an active fragment
-        if ($this->fragmentOpcode === null) {
-            throw new WebSocketException(
-                CloseCode::ProtocolError,
-                'Continuation frame without preceding data frame',
-            );
+        if (strlen($this->buffer) + $frame->length() > $this->maxMessageSize) {
+            $this->reset();
+
+            throw FrameException::messageTooLarge();
         }
 
-        $this->fragmentBuffer .= $frame->payload;
-        $this->validateBufferSize();
+        $opcode = $this->opcode ?? $frame->opcode;
+        $this->opcode = $opcode;
+        $this->buffer .= $frame->payload;
 
-        if (!$frame->fin) {
-            return null;
-        }
+        return $frame->fin ? $this->complete($opcode) : null;
+    }
 
-        // Final continuation frame — assemble complete message
-        $opcode = $this->fragmentOpcode;
-        $payload = $this->fragmentBuffer;
-
-        $this->fragmentOpcode = null;
-        $this->fragmentBuffer = '';
-
-        $this->validateTextPayload($opcode, $payload);
-
-        return new Message($opcode, $payload);
+    public function isAssembling(): bool
+    {
+        return $this->opcode !== null;
     }
 
     public function reset(): void
     {
-        $this->fragmentOpcode = null;
-        $this->fragmentBuffer = '';
+        $this->opcode = null;
+        $this->buffer = '';
     }
 
-    public function isFragmenting(): bool
+    private function complete(Opcode $opcode): Message
     {
-        return $this->fragmentOpcode !== null;
-    }
+        $payload = $this->buffer;
+        $this->reset();
 
-    private function validateBufferSize(): void
-    {
-        if (strlen($this->fragmentBuffer) > $this->maxMessageSize) {
-            $this->reset();
-
-            throw FrameException::payloadTooLarge(
-                strlen($this->fragmentBuffer),
-                $this->maxMessageSize,
-            );
+        if ($opcode === Opcode::Binary) {
+            return Message::binary($payload);
         }
-    }
 
-    private function validateTextPayload(Opcode $opcode, string $payload): void
-    {
-        if ($opcode === Opcode::Text && $payload !== '' && !mb_check_encoding($payload, 'UTF-8')) {
+        try {
+            return Message::text($payload);
+        } catch (InvalidMessageException) {
             throw FrameException::invalidUtf8();
         }
     }
 }
-

@@ -5,42 +5,44 @@ declare(strict_types=1);
 namespace KaririCode\WebSocket\Enum;
 
 /**
- * WebSocket connection lifecycle states (RFC 6455 §7.1.4).
+ * The life of a WebSocket connection after the opening handshake (RFC 6455
+ * §4.1, §7): Open carries data both ways; Closing means a Close frame was
+ * sent and the server waits for the client's; Closed means the TCP
+ * connection is gone. A connection object exists only once the handshake
+ * succeeded, so the CONNECTING state of the RFC belongs to the server.
  *
- * ARFA 1.3 P1 (Immutable State Transformation): immutable value type.
+ * ARFA 1.3: P1 (immutable cases). Spec V4.3.3: pure enum; the names are
+ * not a wire contract.
  *
- * Spec V4.0 §2.1: pure enum.
+ * Preconditions: none.
  *
- * FSM transitions:
- *   Connecting → Open → Closing → Closed
+ * Thread-safety: enum cases are immutable.
  *
- * Only forward transitions are valid. A connection in Closing
- * state may still receive frames but MUST NOT send data frames
- * (RFC 6455 §7.1.1). Query methods encode the RFC rules so callers
- * never need to inspect the raw case.
+ * Side effects: none.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455#section-7.1.4 Connection States
+ * Example:
+ *
+ *     if ($connection->state()->canSend()) {
+ *         $connection->send(Message::text('hello'));
+ *     }
+ *
+ * References: RFC 6455 §4.1 (readyState), §7.1.1–§7.1.4.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-7
  */
 enum ConnectionState
 {
-    case Connecting;
     case Open;
     case Closing;
     case Closed;
 
-    public function canSendData(): bool
+    public function canSend(): bool
     {
         return $this === self::Open;
     }
 
-    public function canReceive(): bool
-    {
-        return $this === self::Open || $this === self::Closing;
-    }
-
-    public function isTerminal(): bool
+    public function isClosed(): bool
     {
         return $this === self::Closed;
     }
 }
-

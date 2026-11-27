@@ -5,68 +5,42 @@ declare(strict_types=1);
 namespace KaririCode\WebSocket\Enum;
 
 /**
- * WebSocket frame opcodes per RFC 6455 §5.2.
+ * The frame opcodes of RFC 6455 §5.2: continuation, text and binary carry
+ * messages; close, ping and pong (0x8 and above) control the connection.
+ * The enum is backed by the opcode because the value is fixed by the wire
+ * format and the IANA registry (errata E-003): tryFrom() reads a frame
+ * header without a lookup table in static state.
  *
- * ARFA 1.3 P1 (Immutable State Transformation): enum cases are
- * inherently immutable value types.
+ * ARFA 1.3: P1 (immutable cases). Spec V4.3.3: backed enum with a
+ * documented external contract (E-003).
  *
- * Spec V4.0 §2.1: pure enum — no backed values. Numeric codes
- * derived via match() so the enum remains closed for modification.
+ * Preconditions: none.
  *
- * Data frames (0x0–0x2) carry application payload; control frames
- * (0x8–0xA) manage connection lifecycle and MUST NOT exceed 125 bytes
- * of payload (RFC 6455 §5.5). Static memoization in tryFromByteValue()
- * avoids repeated array construction on the hot path.
+ * Thread-safety: enum cases are immutable.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2
+ * Side effects: none.
+ *
+ * Example:
+ *
+ *     Opcode::tryFrom(0x9)?->isControl();  // true (Ping)
+ *     Opcode::tryFrom(0x3);                // null: reserved
+ *
+ * References: RFC 6455 §5.2, §5.5, §5.6, §11.8 (opcode registry).
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-5.2
  */
-enum Opcode
+enum Opcode: int
 {
-    case Continuation;
-    case Text;
-    case Binary;
-    case Close;
-    case Ping;
-    case Pong;
+    case Continuation = 0x0;
+    case Text = 0x1;
+    case Binary = 0x2;
+    case Close = 0x8;
+    case Ping = 0x9;
+    case Pong = 0xA;
 
-    public function byteValue(): int
-    {
-        return match ($this) {
-            self::Continuation => 0x0,
-            self::Text         => 0x1,
-            self::Binary       => 0x2,
-            self::Close        => 0x8,
-            self::Ping         => 0x9,
-            self::Pong         => 0xA,
-        };
-    }
-
+    /** Close, Ping and Pong: the opcodes with the most significant bit set. */
     public function isControl(): bool
     {
-        return match ($this) {
-            self::Close, self::Ping, self::Pong => true,
-            default => false,
-        };
-    }
-
-    public function isData(): bool
-    {
-        return !$this->isControl();
-    }
-
-    public static function tryFromByteValue(int $value): ?self
-    {
-        static $map = null;
-
-        $map ??= array_reduce(
-            self::cases(),
-            static function (array $carry, self $case): array {
-                $carry[$case->byteValue()] = $case;
-                return $carry;
-            },
-            [],
-        );
-
-        return $map[$value] ?? null;
+        return $this->value >= 0x8;
     }
 }

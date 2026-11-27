@@ -7,47 +7,52 @@ namespace KaririCode\WebSocket\Integration;
 use KaririCode\Router\Contract\RequestNormalizer;
 use KaririCode\Router\Core\NormalizedRequest;
 use KaririCode\WebSocket\Contract\Connection;
+use KaririCode\WebSocket\Exception\UnsupportedRequestException;
 
 /**
- * Bridges WebSocket connections into Router V4.1 string-based matching.
+ * Lets kariricode/router route WebSocket connections: a connection becomes
+ * a request with the pseudo-method WEBSOCKET and the path its handshake
+ * asked for, so `route(['WEBSOCKET'], '/chat/{room}', ...)` picks the
+ * handler for a connection and its parameters.
  *
- * ARFA 1.3 P4 (Protocol Agnosticism): implements the
- * {@see RequestNormalizer} contract from kariricode/router. This class
- * lives in kariricode/websocket (not in Router) so the Router package
- * has zero knowledge of WebSocket types.
+ * ARFA 1.3: P4 (the router stays protocol-agnostic). Spec V4.3.3: final;
+ * the `object` parameters are the router's RequestNormalizer signature.
  *
- * Spec V4.0: final class, zero state, pure transformation.
+ * Preconditions: normalize() takes what canNormalize() accepted
+ * (UnsupportedRequestException 1870 otherwise).
  *
- * Mapping convention (RFC 6455 §4.1 — client handshake request URI):
- *   method  → "WEBSOCKET" (pseudo-method for route registration)
- *   uri     → connection path (e.g. "/ws/chat/room-42")
- *   original → the {@see Connection} object for handler-level access
+ * Thread-safety: stateless; safe to share.
  *
- * Dependency direction: WebSocket → Router (never reversed).
- * Adding a new protocol requires a new normalizer in that protocol's
- * package — zero changes here or in the Router.
+ * Side effects: none.
  *
- * @see \KaririCode\Router\Contract\RequestNormalizer
- * @see \KaririCode\Router\Core\NormalizedRequest
+ * Example:
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455 WebSocket Protocol
+ *     $routes->route([WebSocketNormalizer::METHOD], '/chat/{room}', ChatRoom::class);
+ *     $request = (new WebSocketNormalizer())->normalize($connection);
+ *     $match = $routes->match($request->method, $request->uri);
+ *
+ * References: kariricode/router RequestNormalizer and NormalizedRequest
+ * (its ADR-002); RFC 6455 §3 (resource name); ADR-002.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-3
  */
 final class WebSocketNormalizer implements RequestNormalizer
 {
+    public const string METHOD = 'WEBSOCKET';
+
+    #[\Override]
     public function canNormalize(object $request): bool
     {
         return $request instanceof Connection;
     }
 
+    #[\Override]
     public function normalize(object $request): NormalizedRequest
     {
-        assert($request instanceof Connection);
+        if (!$request instanceof Connection) {
+            throw UnsupportedRequestException::notAConnection();
+        }
 
-        return new NormalizedRequest(
-            method: 'WEBSOCKET',
-            uri: $request->path() ?: '/',
-            original: $request,
-        );
+        return new NormalizedRequest(method: self::METHOD, uri: $request->path(), original: $request);
     }
 }
-

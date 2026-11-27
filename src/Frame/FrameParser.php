@@ -4,173 +4,158 @@ declare(strict_types=1);
 
 namespace KaririCode\WebSocket\Frame;
 
-use KaririCode\WebSocket\Enum\CloseCode;
 use KaririCode\WebSocket\Enum\Opcode;
 use KaririCode\WebSocket\Exception\FrameException;
+use KaririCode\WebSocket\Exception\InvalidConfigurationException;
 
 /**
- * Parses raw bytes into {@see Frame} value objects per RFC 6455 §5.
+ * Reads one frame from the front of a byte buffer (RFC 6455 §5.2) and
+ * says how many bytes it used, or null when the frame is not complete
+ * yet. Every header rule is checked as soon as its bytes are there, before
+ * the payload arrives: reserved bits and opcodes, the client mask, control
+ * frames that are fragmented or longer than 125 bytes, lengths that are
+ * not minimal or have the top bit set, and the payload limit. A client
+ * therefore cannot make the server buffer more than the limit it set.
  *
- * ARFA 1.3 P2 (Reactive Flow Composition): first stage of the server's
- * data pipeline — raw bytes → Frame → {@see MessageAssembler} → handler.
- * Each stage consumes and produces immutable value objects.
+ * ARFA 1.3: P2 (bytes → Frame, the first stage of the read path).
+ * Spec V4.3.3: final readonly, no state between calls.
  *
- * Spec V4.0: final class, zero state between parse() calls. Configurable
- * payload limit and masking enforcement via constructor parameters.
+ * Preconditions: $maxPayloadSize ≥ 1 (InvalidConfigurationException 1860).
+ * $requireMask is true for a server (client frames must be masked); false
+ * accepts masked and unmasked frames alike.
  *
- * Wire format (RFC 6455 §5.2):
- *   0                   1                   2                   3
- *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
- *  +-+-+-+-+-------+-+-------------+-------------------------------+
- *  |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
- *  |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
- *  |N|V|V|V|       |S|             |   (if payload len==126/127)   |
- *  | |1|2|3|       |K|             |                               |
- *  +-+-+-+-+-------+-+-------------+-------------------------------+
- *  |     Masking-key (0 or 4 bytes)                                |
- *  +-------------------------------+-------------------------------+
- *  |     Payload Data (x bytes)                                    |
- *  +---------------------------------------------------------------+
+ * Thread-safety: stateless; safe to share between connections.
  *
- * Enforces client-to-server masking requirement (RFC 6455 §5.1).
+ * Side effects: none.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2 Base Framing Protocol
+ * Example:
+ *
+ *     $result = (new FrameParser(maxPayloadSize: 65536))->parse($buffer);
+ *     if ($result !== null) {
+ *         [$frame, $used] = $result;
+ *         $buffer = substr($buffer, $used);
+ *     }
+ *
+ * References: RFC 6455 §5.1 (masking), §5.2 (base framing, minimal
+ * length), §5.3 (masking key), §5.5 (control frames), §10.4 (limits);
+ * ADR-001.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-5.2
  */
-final class FrameParser
+final readonly class FrameParser
 {
-    // RFC 6455 §5.2: extended payload length thresholds
-    private const PAYLOAD_LENGTH_16BIT = 126;
-    private const PAYLOAD_LENGTH_64BIT = 127;
-
     public function __construct(
-        private readonly int $maxPayloadSize = 1_048_576,
-        private readonly bool $requireMask = true,
+        public int $maxPayloadSize = 1_048_576,
+        public bool $requireMask = true,
     ) {
+        if ($maxPayloadSize < 1) {
+            throw InvalidConfigurationException::nonPositiveLimit('maxPayloadSize');
+        }
     }
 
     /**
-     * Parses a single frame from a byte buffer.
-     *
-     * Returns [Frame, bytesConsumed] on success, or null if the buffer
-     * does not yet contain a complete frame (wait for more data).
-     *
-     * @return array{Frame, int}|null
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2 Base Framing Protocol
+     * @return array{Frame, int}|null the frame and the bytes it used, or null for more data
      */
     public function parse(string $buffer): ?array
     {
-        $bufferLength = strlen($buffer);
-        $offset = 0;
-
-        // Minimum frame: 2 bytes header
-        if ($bufferLength < 2) {
+        if (strlen($buffer) < 2) {
             return null;
         }
 
-        // ── Byte 0: FIN + RSV + Opcode ───────────────────────────────────────
-        $byte0 = ord($buffer[0]);
-        $fin = ($byte0 & 0x80) !== 0;
-        $rsv = ($byte0 >> 4) & 0x07;
-        $opcodeValue = $byte0 & 0x0F;
+        $first = ord($buffer[0]);
+        $second = ord($buffer[1]);
+        $opcode = $this->opcode($first, $second);
+        $header = $this->length($buffer, $second & 0x7F);
 
-        // RSV bits MUST be 0 unless an extension is negotiated
-        if ($rsv !== 0) {
-            throw new FrameException(
-                CloseCode::ProtocolError,
-                "Non-zero RSV bits without negotiated extension: {$rsv}",
-            );
-        }
-
-        $opcode = Opcode::tryFromByteValue($opcodeValue);
-        if ($opcode === null) {
-            throw FrameException::reservedOpcode($opcodeValue);
-        }
-
-        // ── Byte 1: MASK + Payload Length ────────────────────────────────────
-        $byte1 = ord($buffer[1]);
-        $masked = ($byte1 & 0x80) !== 0;
-        $payloadLength = $byte1 & 0x7F;
-        $offset = 2;
-
-        if ($this->requireMask && !$masked) {
-            throw FrameException::maskRequired();
-        }
-
-        // Extended payload length
-        if ($payloadLength === self::PAYLOAD_LENGTH_16BIT) {
-            if ($bufferLength < $offset + 2) {
-                return null;
-            }
-            $payloadLength = unpack('n', substr($buffer, $offset, 2))[1];
-            $offset += 2;
-        } elseif ($payloadLength === self::PAYLOAD_LENGTH_64BIT) {
-            if ($bufferLength < $offset + 8) {
-                return null;
-            }
-            $payloadLength = unpack('J', substr($buffer, $offset, 8))[1];
-            $offset += 8;
-        }
-
-        // ── Validate payload size ────────────────────────────────────────────
-        if ($payloadLength > $this->maxPayloadSize) {
-            throw FrameException::payloadTooLarge($payloadLength, $this->maxPayloadSize);
-        }
-
-        // Control frames: max 125 bytes, no fragmentation
-        if ($opcode->isControl()) {
-            if ($payloadLength > 125) {
-                throw FrameException::controlFrameTooLarge($payloadLength);
-            }
-            if (!$fin) {
-                throw FrameException::fragmentedControlFrame();
-            }
-        }
-
-        // ── Masking key (4 bytes if masked) ──────────────────────────────────
-        $maskingKey = '';
-        if ($masked) {
-            if ($bufferLength < $offset + 4) {
-                return null;
-            }
-            $maskingKey = substr($buffer, $offset, 4);
-            $offset += 4;
-        }
-
-        // ── Payload ──────────────────────────────────────────────────────────
-        if ($bufferLength < $offset + $payloadLength) {
+        if ($header === null) {
             return null;
         }
 
-        $payload = substr($buffer, $offset, $payloadLength);
-        $offset += $payloadLength;
+        [$length, $offset] = $header;
+        $masked = ($second & 0x80) !== 0;
+        $end = $offset + ($masked ? 4 : 0) + $length;
 
-        // Unmask payload (RFC 6455 §5.3)
-        if ($masked && $payloadLength > 0) {
-            $payload = self::applyMask($payload, $maskingKey);
+        if (strlen($buffer) < $end) {
+            return null;
         }
 
-        $frame = new Frame($fin, $opcode, $payload, $masked);
+        $payload = substr($buffer, $end - $length, $length);
+        $payload = $masked ? self::applyMask($payload, substr($buffer, $offset, 4)) : $payload;
 
-        return [$frame, $offset];
+        return [new Frame(($first & 0x80) !== 0, $opcode, $payload, $masked), $end];
     }
 
     /**
-     * XOR masking/unmasking (RFC 6455 §5.3).
-     * Same operation applies and removes the mask (XOR is self-inverse).
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2 Base Framing Protocol
+     * XORs $data with the 4-byte key repeated to its length (RFC 6455
+     * §5.3); the same call masks and unmasks.
      */
     public static function applyMask(string $data, string $maskingKey): string
     {
-        $length = strlen($data);
-        $result = $data;
+        return $data ^ str_pad('', strlen($data), $maskingKey);
+    }
 
-        for ($i = 0; $i < $length; $i++) {
-            $result[$i] = $data[$i] ^ $maskingKey[$i % 4];
+    /** The opcode, after the rules that need only the first two bytes. */
+    private function opcode(int $first, int $second): Opcode
+    {
+        if (($first & 0x70) !== 0) {
+            throw FrameException::reservedBits();
         }
 
-        return $result;
+        $opcode = Opcode::tryFrom($first & 0x0F) ?? throw FrameException::reservedOpcode();
+
+        if ($this->requireMask && ($second & 0x80) === 0) {
+            throw FrameException::unmaskedClientFrame();
+        }
+
+        if ($opcode->isControl() && ($first & 0x80) === 0) {
+            throw FrameException::fragmentedControlFrame();
+        }
+
+        return $opcode->isControl() && ($second & 0x7F) > 125 ? throw FrameException::controlFrameTooLarge() : $opcode;
+    }
+
+    /**
+     * The payload length and the offset after it, or null while the
+     * extended length is still missing.
+     *
+     * @return array{int, int}|null
+     */
+    private function length(string $buffer, int $short): ?array
+    {
+        $header = match ($short) {
+            126 => self::extended($buffer, 2, 126),
+            127 => self::extended($buffer, 8, 65536),
+            default => [$short, 2],
+        };
+
+        if ($header !== null && $header[0] > $this->maxPayloadSize) {
+            throw FrameException::frameTooLarge();
+        }
+
+        return $header;
+    }
+
+    /**
+     * A 16- or 64-bit length in network order, which must need its size.
+     *
+     * @return array{int, int}|null
+     */
+    private static function extended(string $buffer, int $bytes, int $minimum): ?array
+    {
+        if (strlen($buffer) < 2 + $bytes) {
+            return null;
+        }
+
+        if ((ord($buffer[2]) & 0x80) !== 0 && $bytes === 8) {
+            throw FrameException::lengthOutOfRange();
+        }
+
+        $length = 0;
+
+        foreach (str_split(substr($buffer, 2, $bytes)) as $byte) {
+            $length = ($length << 8) | ord($byte);
+        }
+
+        return $length < $minimum ? throw FrameException::nonMinimalLength() : [$length, 2 + $bytes];
     }
 }
-

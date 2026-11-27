@@ -5,127 +5,106 @@ declare(strict_types=1);
 namespace KaririCode\WebSocket\Server;
 
 use KaririCode\WebSocket\Connection\ConnectionPool;
-use KaririCode\WebSocket\Connection\WebSocketConnection;
 use KaririCode\WebSocket\Contract\MessageHandler;
 use KaririCode\WebSocket\Enum\CloseCode;
-use KaririCode\WebSocket\Enum\ConnectionState;
-use KaririCode\WebSocket\Enum\Opcode;
-use KaririCode\WebSocket\Exception\HandshakeException;
-use KaririCode\WebSocket\Exception\WebSocketException;
-use KaririCode\WebSocket\Frame\Frame;
-use KaririCode\WebSocket\Frame\FrameParser;
-use KaririCode\WebSocket\Frame\FrameWriter;
-use KaririCode\WebSocket\Frame\MessageAssembler;
+use KaririCode\WebSocket\Exception\ConnectionException;
 use KaririCode\WebSocket\Handshake\HandshakeNegotiator;
-use KaririCode\WebSocket\Message\Message;
 
 /**
- * Single-process WebSocket server using stream_select() for I/O multiplexing.
+ * A single-process WebSocket server on non-blocking sockets and
+ * stream_select(). Each round of tick() accepts new clients, feeds the
+ * bytes it reads to their sessions, writes as much pending output as each
+ * socket takes (the rest waits for the next round, so a partial write
+ * never loses a frame), and closes the sockets whose sessions are over, a
+ * client that holds more unsent output than the limit, and a client that
+ * does not answer the server's Close in time. start() binds and loops
+ * until stop(); listen() and tick() let a caller drive the loop itself.
  *
- * ARFA 1.3 P2 (Reactive Flow Composition): incoming data flows through
- * a composable pipeline — {@see FrameParser} → {@see MessageAssembler}
- * → {@see MessageHandler} — where each stage transforms immutable
- * value objects (Frame, Message).
+ * ARFA 1.3: P2 (sockets ↔ sessions). Spec V4.3.3: final; the socket state
+ * of one process.
  *
- * Spec V4.0: final class. Configuration is injected via constructor;
- * per-connection state (buffers, assemblers) is managed internally.
+ * Preconditions: the handler's methods return quickly (they run inside
+ * the loop). TLS terminates in front of the server (a reverse proxy), or
+ * the caller builds its own loop on Integration\TlsContext; the loop
+ * itself speaks plain TCP. For many thousands of connections, an event
+ * loop extension or another runtime fits better than stream_select().
  *
- * For production deployments with 10k+ connections, replace this with
- * a Swoole/RoadRunner/ReactPHP adapter that implements the same
- * pipeline over non-blocking async I/O.
+ * Thread-safety: one process, one thread; not shareable.
  *
- * Lifecycle per connection (RFC 6455 §4–7):
- *   1. Accept TCP → handshake (RFC 6455 §4.2)
- *   2. Read loop: parse frames → assemble messages → dispatch to handler
- *   3. Control frames: Ping→auto-Pong (§5.5.2), Close→echo+disconnect (§7.1)
- *   4. Close: send close frame → disconnect → remove from pool
+ * Side effects: binds a TCP socket, accepts, reads, writes and closes
+ * client sockets; calls the handler.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455 WebSocket Protocol
+ * Example:
+ *
+ *     $server = new WebSocketServer(new ChatHandler(), new HandshakeNegotiator(allowedOrigins: ['https://chat.example.com']));
+ *     pcntl_async_signals(true);
+ *     pcntl_signal(SIGTERM, static fn() => $server->stop());
+ *     $server->start('0.0.0.0', 8080);
+ *
+ * References: RFC 6455 §4.2, §7.1.1 (the server closes the TCP connection
+ * first); PHP manual, stream_socket_server(), stream_select(); ADR-004.
+ *
+ * @see https://www.php.net/manual/en/function.stream-select.php
  */
 final class WebSocketServer
 {
-    private readonly FrameParser $parser;
-    private readonly FrameWriter $writer;
-    private readonly ConnectionPool $pool;
-
-    /** @var array<string, string> Per-connection read buffers */
-    private array $readBuffers = [];
-
-    /** @var array<string, MessageAssembler> Per-connection message assemblers */
-    private array $assemblers = [];
-
-    /** @var array<string, bool> Connections still in handshake phase */
-    private array $pendingHandshake = [];
-
     /** @var resource|null */
-    private $serverSocket = null;
+    private mixed $socket = null;
+
+    /** @var array<int, array{resource, Session}> client socket id => socket and session */
+    private array $clients = [];
+
     private bool $running = false;
 
+    private readonly ServerContext $context;
+
     public function __construct(
-        private readonly MessageHandler $handler,
-        private readonly HandshakeNegotiator $handshake = new HandshakeNegotiator(),
-        private readonly int $maxPayloadSize = 1_048_576,
-        private readonly int $maxMessageSize = 10_485_760,
-        private readonly float $selectTimeout = 0.2,
+        MessageHandler $handler,
+        HandshakeNegotiator $negotiator = new HandshakeNegotiator(),
+        ServerOptions $options = new ServerOptions(),
     ) {
-        $this->parser = new FrameParser($this->maxPayloadSize);
-        $this->writer = new FrameWriter();
-        $this->pool = new ConnectionPool();
+        $this->context = new ServerContext($handler, $negotiator, new ConnectionPool(), $options);
     }
 
     public function connections(): ConnectionPool
     {
-        return $this->pool;
+        return $this->context->pool;
     }
 
     /**
-     * Starts the server and enters the event loop (blocking).
-     *
-     * @param string $host Bind address (0.0.0.0 for all interfaces)
-     * @param int    $port TCP port (1–65535)
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455 WebSocket Protocol
+     * Binds and listens on $host:$port; port 0 takes a free port, which
+     * address() reports. Accepted sockets have TCP_NODELAY: frames are
+     * written whole, so Nagle's algorithm would only delay them.
      */
-    public function start(string $host, int $port): void
+    public function listen(string $host, int $port): void
     {
-        $address = "tcp://{$host}:{$port}";
-        $context = stream_context_create(['socket' => ['backlog' => 128]]);
+        $address = sprintf('tcp://%s:%d', $host, $port);
+        $context = stream_context_create(['socket' => ['backlog' => 128, 'tcp_nodelay' => true]]);
+        $socket = Silently::run(static fn(): mixed => stream_socket_server($address, $code, $message, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context));
 
-        $this->serverSocket = @stream_socket_server(
-            $address,
-            $errorCode,
-            $errorMessage,
-            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
-            $context,
-        );
-
-        if ($this->serverSocket === false) {
-            throw new \RuntimeException("Failed to bind {$address}: [{$errorCode}] {$errorMessage}");
+        if (!is_resource($socket)) {
+            throw ConnectionException::bindFailed($address);
         }
 
-        stream_set_blocking($this->serverSocket, false);
-        $this->running = true;
-
-        $this->eventLoop();
+        $this->socket = $socket;
     }
 
-    public function stop(): void
+    /** "host:port" of the listening socket, or null before listen() and after stop(). */
+    public function address(): ?string
     {
-        $this->running = false;
+        $address = $this->socket === null ? false : stream_socket_get_name($this->socket, false);
 
-        // Close all connections gracefully
-        foreach ($this->pool->all() as $connection) {
-            $connection->close(CloseCode::GoingAway, 'Server shutting down');
-        }
+        return $address === false ? null : $address;
+    }
 
-        $this->pool->clear();
-        $this->readBuffers = [];
-        $this->assemblers = [];
-        $this->pendingHandshake = [];
+    /** Listens and runs the loop until stop(). */
+    public function start(string $host, int $port): void
+    {
+        $this->listen($host, $port);
+        $this->running = true;
 
-        if (is_resource($this->serverSocket)) {
-            fclose($this->serverSocket);
-            $this->serverSocket = null;
+        while ($this->isRunning()) {
+            $this->tick();
         }
     }
 
@@ -134,268 +113,196 @@ final class WebSocketServer
         return $this->running;
     }
 
-    // ── Event Loop ───────────────────────────────────────────────────────
-
-    private function eventLoop(): void
+    /**
+     * One round of the loop: waits up to the select timeout for sockets,
+     * then serves them. Without a listening socket (before listen(), after
+     * stop()) the round does nothing and the loop of start() ends.
+     */
+    public function tick(): void
     {
-        while ($this->running) {
-            $readSockets = $this->buildReadSet();
-            $writeSockets = null;
-            $exceptSockets = null;
+        if ($this->socket === null) {
+            $this->running = false;
 
-            $changed = @stream_select(
-                $readSockets,
-                $writeSockets,
-                $exceptSockets,
-                0,
-                (int) ($this->selectTimeout * 1_000_000),
-            );
+            return;
+        }
 
-            if ($changed === false || $changed === 0) {
-                continue;
+        [$readable, $writable] = $this->ready($this->socket);
+
+        foreach ($readable as $socket) {
+            if ($socket === $this->socket) {
+                $this->accept($socket);
+            } else {
+                $this->read($socket);
             }
+        }
 
-            foreach ($readSockets as $socket) {
-                if ($socket === $this->serverSocket) {
-                    $this->acceptConnection();
-                } else {
-                    $this->handleSocketData($socket);
-                }
-            }
+        foreach ($writable as $socket) {
+            $this->write($socket);
+        }
+
+        $this->sweep(((float) hrtime(true)) / 1e9);
+    }
+
+    /**
+     * Sends Going Away (1001) to every open connection, writes what each
+     * socket takes at once, and closes every socket; the loop of start()
+     * ends.
+     */
+    public function stop(): void
+    {
+        $this->running = false;
+
+        foreach ($this->clients as [$socket, $session]) {
+            $session->shutdown(CloseCode::GoingAway);
+            $pending = $session->pending();
+            Silently::run(static fn(): int|false => fwrite($socket, $pending));
+            $this->drop($socket, $session);
+        }
+
+        if ($this->socket !== null) {
+            $socket = $this->socket;
+            $this->socket = null;
+            Silently::run(static fn(): bool => fclose($socket));
         }
     }
 
     /**
-     * @return list<resource>
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455 WebSocket Protocol
+     * @param resource $server
+     *
+     * @return array{array<array-key, resource>, array<array-key, resource>} readable and writable sockets
      */
-    private function buildReadSet(): array
+    private function ready(mixed $server): array
     {
-        $sockets = [$this->serverSocket];
+        $read = [$server];
+        $write = [];
 
-        foreach ($this->pool->all() as $connection) {
-            if ($connection instanceof WebSocketConnection) {
-                $socket = $connection->socket();
-                if ($socket !== null) {
-                    $sockets[] = $socket;
-                }
+        foreach ($this->clients as [$socket, $session]) {
+            $read[] = $socket;
+
+            if ($session->pending() !== '') {
+                $write[] = $socket;
             }
         }
 
-        return $sockets;
+        $except = null;
+        $timeout = $this->context->options->selectTimeout;
+        $seconds = (int) $timeout;
+        $microseconds = (int) (fmod($timeout, 1.0) * 1e6);
+        $changed = Silently::run(static function () use (&$read, &$write, &$except, $seconds, $microseconds): int|false {
+            return stream_select($read, $write, $except, $seconds, $microseconds);
+        });
+
+        return $changed === false ? [[], []] : [$read, $write];
     }
 
-    // ── Connection Acceptance ────────────────────────────────────────────
-
-    private function acceptConnection(): void
+    /**
+     * @param resource $server
+     */
+    private function accept(mixed $server): void
     {
-        $clientSocket = @stream_socket_accept($this->serverSocket, 0, $peerName);
-        if ($clientSocket === false) {
+        $peer = '';
+        $client = Silently::run(static function () use ($server, &$peer): mixed {
+            return stream_socket_accept($server, 0, $peer);
+        });
+
+        if (!is_resource($client)) {
             return;
         }
 
-        stream_set_blocking($clientSocket, false);
-
-        $connectionId = bin2hex(random_bytes(8));
-
-        $connection = new WebSocketConnection(
-            $connectionId,
-            $clientSocket,
-            $peerName ?? 'unknown',
-            '/',
-            $this->writer,
-        );
-
-        $connection->transitionTo(ConnectionState::Connecting);
-        $this->pool->add($connection);
-        $this->readBuffers[$connectionId] = '';
-        $this->assemblers[$connectionId] = new MessageAssembler($this->maxMessageSize);
-        $this->pendingHandshake[$connectionId] = true;
+        stream_set_blocking($client, false);
+        $this->clients[(int) $client] = [$client, new Session(self::text($peer), $this->context)];
     }
-
-    // ── Data Handling ────────────────────────────────────────────────────
 
     /**
      * @param resource $socket
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455 WebSocket Protocol
      */
-    private function handleSocketData($socket): void
+    private function read(mixed $socket): void
     {
-        $connection = $this->findConnectionBySocket($socket);
-        if ($connection === null) {
+        $session = $this->session($socket);
+
+        if ($session === null) {
             return;
         }
 
-        $connectionId = $connection->id();
-        $data = @fread($socket, 65536);
+        $chunk = $this->context->options->readChunk;
+        $data = Silently::run(static fn(): string|false => fread($socket, $chunk));
+
+        if ($data === '' && !feof($socket)) {
+            return;
+        }
 
         if ($data === false || $data === '') {
-            $this->removeConnection($connectionId, CloseCode::AbnormalClosure, 'Connection lost');
+            $this->drop($socket, $session);
+
             return;
         }
 
-        $this->readBuffers[$connectionId] .= $data;
-
-        // Handshake phase
-        if (isset($this->pendingHandshake[$connectionId])) {
-            $this->processHandshake($connection);
-            return;
-        }
-
-        // Frame parsing phase
-        $this->processFrames($connection);
-    }
-
-    private function processHandshake(WebSocketConnection $connection): void
-    {
-        $connectionId = $connection->id();
-        $buffer = $this->readBuffers[$connectionId];
-
-        // Wait for complete HTTP request (\r\n\r\n)
-        if (strpos($buffer, "\r\n\r\n") === false) {
-            return;
-        }
-
-        try {
-            $parsed = $this->handshake->parseRequest($buffer);
-            $response = $this->handshake->negotiate($parsed['headers']);
-
-            $socket = $connection->socket();
-            if ($socket === null) {
-                $this->removeConnection($connectionId, CloseCode::AbnormalClosure);
-                return;
-            }
-
-            fwrite($socket, $response);
-
-            $connection->transitionTo(ConnectionState::Open);
-            unset($this->pendingHandshake[$connectionId]);
-            $this->readBuffers[$connectionId] = '';
-
-            $this->handler->onOpen($connection);
-
-        } catch (HandshakeException $e) {
-            $socket = $connection->socket();
-            if ($socket !== null) {
-                $errorResponse = "HTTP/1.1 {$e->httpStatusCode} {$e->getMessage()}\r\n"
-                    . "Connection: close\r\n\r\n";
-                @fwrite($socket, $errorResponse);
-            }
-            $this->removeConnection($connectionId, CloseCode::ProtocolError, $e->getMessage());
-        }
-    }
-
-    private function processFrames(WebSocketConnection $connection): void
-    {
-        $connectionId = $connection->id();
-
-        while (true) {
-            $buffer = $this->readBuffers[$connectionId] ?? '';
-            if ($buffer === '') {
-                break;
-            }
-
-            try {
-                $result = $this->parser->parse($buffer);
-            } catch (WebSocketException $e) {
-                $this->handler->onError($connection, $e);
-                $this->removeConnection($connectionId, $e->closeCode, $e->getMessage());
-                return;
-            }
-
-            if ($result === null) {
-                break; // Incomplete frame — wait for more data
-            }
-
-            [$frame, $consumed] = $result;
-            $this->readBuffers[$connectionId] = substr($buffer, $consumed);
-
-            $this->handleFrame($connection, $frame);
-
-            if ($connection->state()->isTerminal()) {
-                return;
-            }
-        }
-    }
-
-    private function handleFrame(WebSocketConnection $connection, Frame $frame): void
-    {
-        $connectionId = $connection->id();
-
-        // RFC 6455 §5.5.2: respond to Ping with matching Pong
-        if ($frame->opcode === Opcode::Ping) {
-            $connection->writeFrame(Frame::pong($frame->payload));
-            return;
-        }
-
-        if ($frame->opcode === Opcode::Pong) {
-            return; // Unsolicited pongs are ignored per RFC 6455 §5.5.3
-        }
-
-        if ($frame->opcode === Opcode::Close) {
-            $code = CloseCode::NormalClosure;
-            $reason = '';
-            if (strlen($frame->payload) >= 2) {
-                $codeValue = unpack('n', substr($frame->payload, 0, 2))[1];
-                $code = CloseCode::tryFromCode($codeValue) ?? CloseCode::NormalClosure;
-                $reason = substr($frame->payload, 2);
-            }
-
-            $this->removeConnection($connectionId, $code, $reason);
-            return;
-        }
-
-        // Data frames → assembler
-        try {
-            $assembler = $this->assemblers[$connectionId] ?? null;
-            if ($assembler === null) {
-                return;
-            }
-
-            $message = $assembler->feed($frame);
-            if ($message !== null) {
-                $this->handler->onMessage($connection, $message);
-            }
-        } catch (WebSocketException $e) {
-            $this->handler->onError($connection, $e);
-            $this->removeConnection($connectionId, $e->closeCode, $e->getMessage());
-        }
-    }
-
-    // ── Connection Cleanup ───────────────────────────────────────────────
-
-    private function removeConnection(string $connectionId, CloseCode $code = CloseCode::NormalClosure, string $reason = ''): void
-    {
-        $connection = $this->pool->remove($connectionId);
-
-        if ($connection !== null) {
-            $this->handler->onClose($connection, $code->numericCode(), $reason);
-            $connection->close($code, $reason);
-        }
-
-        unset(
-            $this->readBuffers[$connectionId],
-            $this->assemblers[$connectionId],
-            $this->pendingHandshake[$connectionId],
-        );
+        $session->receive($data);
     }
 
     /**
      * @param resource $socket
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455 WebSocket Protocol
      */
-    private function findConnectionBySocket($socket): ?WebSocketConnection
+    private function write(mixed $socket): void
     {
-        foreach ($this->pool->all() as $connection) {
-            if ($connection instanceof WebSocketConnection && $connection->socket() === $socket) {
-                return $connection;
-            }
+        $session = $this->session($socket);
+
+        if ($session === null) {
+            return;   // read() dropped it in this round
         }
 
-        return null;
+        $pending = $session->pending();
+        $written = Silently::run(static fn(): int|false => fwrite($socket, $pending));
+
+        if ($written === false) {
+            $this->drop($socket, $session);
+        } else {
+            $session->written($written);
+        }
+    }
+
+    /** Closes the sockets whose sessions are over or hold too much unsent output. */
+    private function sweep(float $now): void
+    {
+        $options = $this->context->options;
+
+        foreach ($this->clients as [$socket, $session]) {
+            $session->tick($now, $options->closeTimeout);
+
+            if ($session->isDone() || strlen($session->pending()) > $options->maxBufferedOutput) {
+                $this->drop($socket, $session);
+            }
+        }
+    }
+
+    /**
+     * @param resource $socket
+     */
+    private function drop(mixed $socket, Session $session): void
+    {
+        unset($this->clients[(int) $socket]);
+        $connection = $session->connection();
+
+        if ($connection !== null) {
+            $this->context->pool->remove($connection->id());
+        }
+
+        $session->end();
+        Silently::run(static fn(): bool => fclose($socket));
+    }
+
+    /**
+     * @param resource $socket
+     */
+    private function session(mixed $socket): ?Session
+    {
+        $entry = $this->clients[(int) $socket] ?? null;
+
+        return $entry === null ? null : $entry[1];
+    }
+
+    private static function text(mixed $value): string
+    {
+        return is_string($value) ? $value : '';
     }
 }
-

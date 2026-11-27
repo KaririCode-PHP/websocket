@@ -5,52 +5,40 @@ declare(strict_types=1);
 namespace KaririCode\WebSocket\Frame;
 
 /**
- * Serializes {@see Frame} objects into wire-format bytes (RFC 6455 §5.2).
+ * Turns a frame into the bytes a server sends (RFC 6455 §5.2): FIN and
+ * opcode, then the payload length in its shortest form (7 bits up to 125,
+ * 16 bits up to 65535, 64 bits beyond), then the payload. Server frames
+ * are never masked (§5.1), whatever the frame's masked flag says.
  *
- * ARFA 1.3 P2 (Reactive Flow Composition): output stage of the
- * server's write path — Frame → bytes → socket.
+ * ARFA 1.3: P2 (Frame → bytes, the last stage of the write path).
+ * Spec V4.3.3: final readonly, pure function.
  *
- * Spec V4.0: final class, zero state, pure transformation.
+ * Preconditions: none; Frame already enforces the control-frame rules.
  *
- * Server-to-client frames MUST NOT be masked (RFC 6455 §5.1).
- * Payload length is encoded using the shortest possible representation:
- * 0–125 inline, 126–65535 with 16-bit extension, 65536+ with 64-bit.
+ * Thread-safety: stateless; safe to share.
  *
- * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2 Base Framing Protocol
+ * Side effects: none.
+ *
+ * Example:
+ *
+ *     $bytes = (new FrameWriter())->write(Frame::text('{"event":"update"}'));
+ *     // "\x81\x12{\"event\":\"update\"}"
+ *
+ * References: RFC 6455 §5.1, §5.2; ADR-001.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6455#section-5.2
  */
-final class FrameWriter
+final readonly class FrameWriter
 {
-    /**
-     * Encodes a Frame into its binary wire representation.
-      *
-      * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2 Base Framing Protocol
-     */
     public function write(Frame $frame): string
     {
-        $buffer = '';
+        $length = $frame->length();
+        $length = match (true) {
+            $length <= 125 => chr($length),
+            $length <= 0xFFFF => chr(126) . pack('n', $length),
+            default => chr(127) . pack('J', $length),
+        };
 
-        // ── Byte 0: FIN + opcode ─────────────────────────────────────────────
-        $byte0 = $frame->opcode->byteValue() & 0x0F;
-        if ($frame->fin) {
-            $byte0 |= 0x80;
-        }
-        $buffer .= chr($byte0);
-
-        // ── Byte 1+ : payload length (server frames: mask bit = 0) ───────────
-        $length = $frame->payloadLength();
-
-        if ($length <= 125) {
-            $buffer .= chr($length);
-        } elseif ($length <= 65535) {
-            $buffer .= chr(126) . pack('n', $length);
-        } else {
-            $buffer .= chr(127) . pack('J', $length);
-        }
-
-        // ── Payload ──────────────────────────────────────────────────────────
-        $buffer .= $frame->payload;
-
-        return $buffer;
+        return chr(($frame->fin ? 0x80 : 0) | $frame->opcode->value) . $length . $frame->payload;
     }
 }
-
