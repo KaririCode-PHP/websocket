@@ -5,56 +5,58 @@ declare(strict_types=1);
 namespace KaririCode\WebSocket\Tests\Unit\Message;
 
 use KaririCode\WebSocket\Enum\Opcode;
+use KaririCode\WebSocket\Exception\InvalidMessageException;
+use KaririCode\WebSocket\Exception\WsCode;
 use KaririCode\WebSocket\Message\Message;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
+#[CoversClass(Message::class)]
 final class MessageTest extends TestCase
 {
-    public function testTextFactory(): void
+    #[Test]
+    public function textIsUtf8AndBinaryIsAnyBytes(): void
     {
-        $msg = Message::text('Hello');
+        $text = Message::text('{"name":"São Paulo"}');
+        $binary = Message::binary("\x00\x01\xFF");
 
-        self::assertSame(Opcode::Text, $msg->opcode);
-        self::assertSame('Hello', $msg->payload);
-        self::assertTrue($msg->isText());
-        self::assertFalse($msg->isBinary());
-        self::assertSame(5, $msg->length());
+        self::assertSame(Opcode::Text, $text->opcode);
+        self::assertTrue($text->isText());
+        self::assertFalse($text->isBinary());
+        self::assertSame(21, $text->length());
+        self::assertSame(Opcode::Binary, $binary->opcode);
+        self::assertTrue($binary->isBinary());
+        self::assertFalse($binary->isText());
+        self::assertSame("\x00\x01\xFF", $binary->payload);
+        self::assertSame('', Message::text('')->payload);
     }
 
-    public function testBinaryFactory(): void
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function invalidUtf8(): iterable
     {
-        $msg = Message::binary("\x00\xFF");
-
-        self::assertSame(Opcode::Binary, $msg->opcode);
-        self::assertSame("\x00\xFF", $msg->payload);
-        self::assertTrue($msg->isBinary());
-        self::assertFalse($msg->isText());
-        self::assertSame(2, $msg->length());
+        yield 'lone continuation byte' => ["\x80"];
+        yield 'truncated sequence' => ["\xC3"];
+        yield 'overlong encoding' => ["\xC0\xAF"];
+        yield 'surrogate half' => ["\xED\xA0\x80"];
+        yield 'above U+10FFFF' => ["\xF4\x90\x80\x80"];
+        yield 'invalid byte' => ["ok\xFF"];
     }
 
-    public function testEmptyPayload(): void
+    #[Test]
+    #[DataProvider('invalidUtf8')]
+    public function textThatIsNotUtf8IsRefused(string $payload): void
     {
-        $msg = Message::text('');
+        try {
+            Message::text($payload);
+            self::fail('invalid UTF-8 was accepted');
+        } catch (InvalidMessageException $e) {
+            self::assertSame(WsCode::TextNotUtf8, $e->errorCode);
+        }
 
-        self::assertSame(0, $msg->length());
-        self::assertSame('', $msg->payload);
-    }
-
-    public function testControlOpcodeMessage(): void
-    {
-        $msg = new Message(Opcode::Ping, 'alive');
-
-        self::assertSame(Opcode::Ping, $msg->opcode);
-        self::assertFalse($msg->isText());
-        self::assertFalse($msg->isBinary());
-    }
-
-    public function testReadonlyProperties(): void
-    {
-        $msg = Message::text('immutable');
-
-        // Verify readonly — should not be assignable
-        $ref = new \ReflectionProperty($msg, 'payload');
-        self::assertTrue($ref->isReadOnly());
+        self::assertSame($payload, Message::binary($payload)->payload);
     }
 }

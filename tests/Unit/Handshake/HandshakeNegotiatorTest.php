@@ -5,252 +5,285 @@ declare(strict_types=1);
 namespace KaririCode\WebSocket\Tests\Unit\Handshake;
 
 use KaririCode\WebSocket\Exception\HandshakeException;
+use KaririCode\WebSocket\Exception\InvalidConfigurationException;
+use KaririCode\WebSocket\Exception\WsCode;
 use KaririCode\WebSocket\Handshake\HandshakeNegotiator;
+use KaririCode\WebSocket\Handshake\HandshakeRequest;
+use KaririCode\WebSocket\Handshake\HandshakeResponse;
+use KaririCode\WebSocket\Tests\Support\Client;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
+#[CoversClass(HandshakeNegotiator::class)]
+#[CoversClass(HandshakeRequest::class)]
+#[CoversClass(HandshakeResponse::class)]
+#[CoversClass(HandshakeException::class)]
 final class HandshakeNegotiatorTest extends TestCase
 {
-    private HandshakeNegotiator $negotiator;
+    // ── Accepted handshakes ──────────────────────────────────────────────
 
-    protected function setUp(): void
+    #[Test]
+    public function aValidHandshakeGets101WithTheRfcAcceptValue(): void
     {
-        $this->negotiator = new HandshakeNegotiator();
+        $negotiator = new HandshakeNegotiator();
+
+        $response = $negotiator->negotiate($negotiator->parseRequest(Client::handshake()));
+
+        self::assertSame("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " . Client::ACCEPT . "\r\n\r\n", $response->head);
+        self::assertNull($response->subprotocol);
+        self::assertSame(Client::ACCEPT, HandshakeNegotiator::acceptKey(Client::KEY));
     }
 
-    // ── Request Parsing ──────────────────────────────────────────────────
-
-    public function testParseValidRequest(): void
+    #[Test]
+    public function theRequestKeepsTargetAndFields(): void
     {
-        $raw = "GET /ws/chat HTTP/1.1\r\n"
-            . "Host: example.com\r\n"
-            . "Upgrade: websocket\r\n"
-            . "Connection: Upgrade\r\n"
-            . "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-            . "Sec-WebSocket-Version: 13\r\n"
-            . "\r\n";
+        $request = (new HandshakeNegotiator())->parseRequest(Client::handshake(['Cookie' => 'session=abc']));
 
-        $parsed = $this->negotiator->parseRequest($raw);
-
-        self::assertSame('GET', $parsed['method']);
-        self::assertSame('/ws/chat', $parsed['path']);
-        self::assertSame('websocket', $parsed['headers']['upgrade']);
-        self::assertSame('dGhlIHNhbXBsZSBub25jZQ==', $parsed['headers']['sec-websocket-key']);
+        self::assertSame('/chat?room=7', $request->target);
+        self::assertSame('/chat', $request->path());
+        self::assertSame('room=7', $request->query());
+        self::assertSame('session=abc', $request->header('COOKIE'));
+        self::assertNull($request->header('x-absent'));
+        self::assertSame(['server.example.com'], $request->headers['host']);
     }
 
-    public function testParseInvalidRequestLineThrows(): void
+    #[Test]
+    public function aTargetWithoutQueryIsAllPath(): void
     {
-        $raw = "POST /invalid HTTP/1.1\r\n\r\n";
+        $request = new HandshakeRequest('/plain', []);
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->parseRequest($raw);
+        self::assertSame('/plain', $request->path());
+        self::assertSame('', $request->query());
     }
 
-    // ── Handshake Negotiation ────────────────────────────────────────────
-
-    public function testSuccessfulNegotiation(): void
+    #[Test]
+    public function repeatedFieldsAreJoinedInOrder(): void
     {
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-        ];
+        $head = "GET / HTTP/1.1\r\nHost: a\r\nSec-WebSocket-Protocol: one\r\nSec-WebSocket-Protocol: two, three\r\n\r\n";
 
-        $response = $this->negotiator->negotiate($headers);
+        $request = (new HandshakeNegotiator())->parseRequest($head);
 
-        self::assertStringContainsString('HTTP/1.1 101 Switching Protocols', $response);
-        self::assertStringContainsString('Upgrade: websocket', $response);
-        self::assertStringContainsString('Connection: Upgrade', $response);
-        self::assertStringContainsString('Sec-WebSocket-Accept:', $response);
+        self::assertSame('one, two, three', $request->header('sec-websocket-protocol'));
     }
 
-    public function testAcceptKeyComputation(): void
+    #[Test]
+    public function tokenListsMatchWithoutRegardToCaseOrPosition(): void
     {
-        // RFC 6455 §4.2.2 reference test vector
-        $key = 'dGhlIHNhbXBsZSBub25jZQ==';
-        $expected = 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=';
+        $negotiator = new HandshakeNegotiator();
+        $head = Client::handshake(['Upgrade' => 'h2c, WebSocket', 'Connection' => 'keep-alive, UPGRADE']);
 
-        $accept = HandshakeNegotiator::computeAcceptKey($key);
-        self::assertSame($expected, $accept);
+        self::assertStringStartsWith('HTTP/1.1 101', $negotiator->negotiate($negotiator->parseRequest($head))->head);
     }
 
-    public function testMissingUpgradeHeaderThrows(): void
+    #[Test]
+    public function theFirstOfferedSubprotocolTheServerSpeaksIsSelected(): void
     {
-        $headers = [
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-        ];
+        $negotiator = new HandshakeNegotiator(subprotocols: ['chat.v2', 'chat.v1']);
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->negotiate($headers);
+        $response = $negotiator->negotiate($negotiator->parseRequest(Client::handshake(['Sec-WebSocket-Protocol' => 'json, chat.v1 ,chat.v2'])));
+        $none = $negotiator->negotiate($negotiator->parseRequest(Client::handshake(['Sec-WebSocket-Protocol' => 'json'])));
+        $unasked = $negotiator->negotiate($negotiator->parseRequest(Client::handshake()));
+
+        self::assertSame('chat.v1', $response->subprotocol);
+        self::assertStringContainsString("\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n", $response->head);
+        self::assertNull($none->subprotocol);
+        self::assertStringNotContainsString('Sec-WebSocket-Protocol', $none->head);
+        self::assertNull($unasked->subprotocol);
     }
 
-    public function testWrongUpgradeValueThrows(): void
+    #[Test]
+    public function subprotocolsCompareExactly(): void
     {
-        $headers = [
-            'upgrade' => 'h2c',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-        ];
+        $negotiator = new HandshakeNegotiator(subprotocols: ['chat']);
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->negotiate($headers);
+        self::assertNull($negotiator->negotiate($negotiator->parseRequest(Client::handshake(['Sec-WebSocket-Protocol' => 'CHAT'])))->subprotocol);
     }
 
-    public function testMissingConnectionHeaderThrows(): void
-    {
-        $headers = [
-            'upgrade' => 'websocket',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-        ];
+    // ── The request head ─────────────────────────────────────────────────
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->negotiate($headers);
+    #[Test]
+    public function theHeadEndsAtTheBlankLine(): void
+    {
+        $negotiator = new HandshakeNegotiator();
+        $head = Client::handshake();
+
+        self::assertNull($negotiator->head(substr($head, 0, -1)));
+        self::assertNull($negotiator->head(''));
+        self::assertSame($head, $negotiator->head($head . "\x81\x80frame bytes"));
     }
 
-    public function testUnsupportedVersionThrows(): void
+    #[Test]
+    public function aHeadAboveTheLimitIsRefusedWithOrWithoutItsEnd(): void
     {
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '8',
-        ];
+        $negotiator = new HandshakeNegotiator(maxRequestSize: 64);
+        $long = Client::handshake();
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->negotiate($headers);
+        self::assertSame("GET / HTTP/1.1\r\nHost: a\r\n\r\n", $negotiator->head("GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+
+        foreach ([str_repeat('a', 65), $long, substr($long, 0, 80)] as $buffer) {
+            self::assertRefused(WsCode::HandshakeTooLarge, 431, static fn() => $negotiator->head($buffer));
+        }
+
+        self::assertRefused(WsCode::HandshakeTooLarge, 431, static fn() => $negotiator->parseRequest($long));
+        self::assertNull($negotiator->head(str_repeat('a', 64)), 'exactly the limit is still allowed to grow into a head');
+
+        $exact = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        self::assertSame('a', (new HandshakeNegotiator(maxRequestSize: strlen($exact)))->parseRequest($exact)->header('host'), 'a head of exactly the limit is read');
     }
 
-    public function testInvalidKeyThrows(): void
+    #[Test]
+    public function aFieldValueMayFollowTheColonWithoutASpace(): void
     {
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'not-valid-base64',
-            'sec-websocket-version' => '13',
-        ];
+        $request = (new HandshakeNegotiator())->parseRequest("GET / HTTP/1.1\r\nHost:example.com\r\n\r\n");
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->negotiate($headers);
+        self::assertSame('example.com', $request->header('host'));
     }
 
-    public function testEmptyKeyThrows(): void
-    {
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => '',
-            'sec-websocket-version' => '13',
-        ];
+    // ── Refused requests ─────────────────────────────────────────────────
 
-        $this->expectException(HandshakeException::class);
-        $this->negotiator->negotiate($headers);
+    /**
+     * @return iterable<string, array{string, WsCode, int}>
+     */
+    public static function malformedRequests(): iterable
+    {
+        yield 'POST' => [Client::handshake(requestLine: 'POST /chat HTTP/1.1'), WsCode::MethodNotGet, 400];
+        yield 'lower-case get' => [Client::handshake(requestLine: 'get /chat HTTP/1.1'), WsCode::MethodNotGet, 400];
+        yield 'HTTP/1.0' => [Client::handshake(requestLine: 'GET /chat HTTP/1.0'), WsCode::UnsupportedHttpVersion, 400];
+        yield 'HTTP/2' => [Client::handshake(requestLine: 'GET /chat HTTP/2'), WsCode::UnsupportedHttpVersion, 400];
+        yield 'double space' => [Client::handshake(requestLine: 'GET  /chat HTTP/1.1'), WsCode::MalformedRequestLine, 400];
+        yield 'no version' => [Client::handshake(requestLine: 'GET /chat'), WsCode::MalformedRequestLine, 400];
+        yield 'method not a token' => [Client::handshake(requestLine: 'G(T /chat HTTP/1.1'), WsCode::MalformedRequestLine, 400];
+        yield 'absolute-form target' => [Client::handshake(requestLine: 'GET http://a/chat HTTP/1.1'), WsCode::MalformedRequestLine, 400];
+        yield 'asterisk target' => [Client::handshake(requestLine: 'GET * HTTP/1.1'), WsCode::MalformedRequestLine, 400];
+        yield 'control character in the target' => [Client::handshake(requestLine: "GET /a\x01 HTTP/1.1"), WsCode::MalformedRequestLine, 400];
+        yield 'empty request line' => [Client::handshake(requestLine: ''), WsCode::MalformedRequestLine, 400];
+        yield 'field without colon' => ["GET / HTTP/1.1\r\nHost a\r\n\r\n", WsCode::MalformedHeader, 400];
+        yield 'space before the colon' => ["GET / HTTP/1.1\r\nHost : a\r\n\r\n", WsCode::MalformedHeader, 400];
+        yield 'folded line' => ["GET / HTTP/1.1\r\nHost: a\r\n continued\r\n\r\n", WsCode::MalformedHeader, 400];
+        yield 'control character in a value' => ["GET / HTTP/1.1\r\nHost: a\x7F\r\n\r\n", WsCode::MalformedHeader, 400];
+        yield 'bare line feed in a value' => ["GET / HTTP/1.1\r\nHost: a\nX: y\r\n\r\n", WsCode::MalformedHeader, 400];
+        yield 'no blank line' => ["GET / HTTP/1.1\r\nHost: a\r\n", WsCode::MalformedHeader, 400];
+        yield 'blank line inside' => ["GET / HTTP/1.1\r\nHost: a\r\n\r\nX: y\r\n\r\n", WsCode::MalformedHeader, 400];
+        yield 'two Host fields' => ["GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", WsCode::DuplicateHeader, 400];
+        yield 'two keys' => [str_replace("\r\n\r\n", "\r\nSec-WebSocket-Key: " . Client::KEY . "\r\n\r\n", Client::handshake()), WsCode::DuplicateHeader, 400];
+        yield 'two versions' => [str_replace("\r\n\r\n", "\r\nsec-websocket-version: 13\r\n\r\n", Client::handshake()), WsCode::DuplicateHeader, 400];
+        yield 'two origins' => [str_replace("\r\n\r\n", "\r\nOrigin: https://evil.example\r\n\r\n", Client::handshake()), WsCode::DuplicateHeader, 400];
     }
 
-    // ── Origin Validation ────────────────────────────────────────────────
-
-    public function testOriginAllowlistAccepts(): void
+    #[Test]
+    #[DataProvider('malformedRequests')]
+    public function aMalformedRequestIsRefused(string $head, WsCode $code, int $status): void
     {
-        $negotiator = new HandshakeNegotiator(allowedOrigins: ['https://example.com']);
-
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-            'origin' => 'https://example.com',
-        ];
-
-        $response = $negotiator->negotiate($headers);
-        self::assertStringContainsString('101', $response);
+        self::assertRefused($code, $status, static fn() => (new HandshakeNegotiator())->parseRequest($head));
     }
 
-    public function testOriginAllowlistRejects(): void
+    /**
+     * @return iterable<string, array{array<string, string|null>, WsCode, int}>
+     */
+    public static function invalidHandshakes(): iterable
     {
-        $negotiator = new HandshakeNegotiator(allowedOrigins: ['https://example.com']);
-
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-            'origin' => 'https://evil.com',
-        ];
-
-        $this->expectException(HandshakeException::class);
-        $negotiator->negotiate($headers);
+        yield 'no Host' => [['Host' => null], WsCode::MissingHost, 400];
+        yield 'empty Host' => [['Host' => ''], WsCode::MissingHost, 400];
+        yield 'no Upgrade' => [['Upgrade' => null], WsCode::MissingUpgrade, 400];
+        yield 'another upgrade' => [['Upgrade' => 'h2c'], WsCode::MissingUpgrade, 400];
+        yield 'websocket as part of a word' => [['Upgrade' => 'websockets'], WsCode::MissingUpgrade, 400];
+        yield 'no Connection' => [['Connection' => null], WsCode::MissingConnectionUpgrade, 400];
+        yield 'Connection without upgrade' => [['Connection' => 'keep-alive'], WsCode::MissingConnectionUpgrade, 400];
+        yield 'upgrade as part of a word' => [['Connection' => 'NotUpgrade'], WsCode::MissingConnectionUpgrade, 400];
+        yield 'version 8' => [['Sec-WebSocket-Version' => '8'], WsCode::UnsupportedVersion, 426];
+        yield 'no version' => [['Sec-WebSocket-Version' => null], WsCode::UnsupportedVersion, 426];
+        yield 'no key' => [['Sec-WebSocket-Key' => null], WsCode::InvalidKey, 400];
+        yield 'short key' => [['Sec-WebSocket-Key' => 'c2hvcnQ='], WsCode::InvalidKey, 400];
+        yield 'key of 17 bytes' => [['Sec-WebSocket-Key' => base64_encode(str_repeat('k', 17))], WsCode::InvalidKey, 400];
+        yield 'key not base64' => [['Sec-WebSocket-Key' => '!!!!!!!!!!!!!!!!!!!!!!=='], WsCode::InvalidKey, 400];
     }
 
-    public function testEmptyAllowlistAcceptsAll(): void
+    /**
+     * @param array<string, string|null> $headers
+     */
+    #[Test]
+    #[DataProvider('invalidHandshakes')]
+    public function anInvalidHandshakeIsRefused(array $headers, WsCode $code, int $status): void
     {
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-            'origin' => 'https://anything.com',
-        ];
+        $negotiator = new HandshakeNegotiator();
+        $request = $negotiator->parseRequest(Client::handshake($headers));
 
-        $response = $this->negotiator->negotiate($headers);
-        self::assertStringContainsString('101', $response);
+        self::assertRefused($code, $status, static fn() => $negotiator->negotiate($request));
     }
 
-    // ── Subprotocol Negotiation ──────────────────────────────────────────
-
-    public function testSubprotocolNegotiation(): void
+    #[Test]
+    public function theOriginAllowListIsEnforced(): void
     {
-        $negotiator = new HandshakeNegotiator(
-            supportedProtocols: ['graphql-ws', 'chat'],
-        );
+        $negotiator = new HandshakeNegotiator(allowedOrigins: ['https://App.Example.com', 'http://localhost:8080']);
+        $allowed = self::request($negotiator, []);
+        $local = self::request($negotiator, ['Origin' => 'http://localhost:8080']);
+        $evil = self::request($negotiator, ['Origin' => 'https://evil.example']);
+        $none = self::request($negotiator, ['Origin' => null]);
 
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-            'sec-websocket-protocol' => 'chat, superchat',
-        ];
-
-        $response = $negotiator->negotiate($headers);
-        self::assertStringContainsString('Sec-WebSocket-Protocol: chat', $response);
+        self::assertStringStartsWith('HTTP/1.1 101', $negotiator->negotiate($allowed)->head, 'origins compare without regard to case');
+        self::assertStringStartsWith('HTTP/1.1 101', $negotiator->negotiate($local)->head);
+        self::assertRefused(WsCode::OriginRejected, 403, static fn() => $negotiator->negotiate($evil));
+        self::assertRefused(WsCode::OriginRejected, 403, static fn() => $negotiator->negotiate($none));
+        self::assertStringStartsWith('HTTP/1.1 101', (new HandshakeNegotiator())->negotiate($none)->head, 'no list, no check');
     }
 
-    public function testSubprotocolNoMatch(): void
+    // ── Rejections ───────────────────────────────────────────────────────
+
+    #[Test]
+    public function aRejectionIsAFixedResponse(): void
     {
-        $negotiator = new HandshakeNegotiator(
-            supportedProtocols: ['graphql-ws'],
-        );
-
-        $headers = [
-            'upgrade' => 'websocket',
-            'connection' => 'Upgrade',
-            'sec-websocket-key' => 'dGhlIHNhbXBsZSBub25jZQ==',
-            'sec-websocket-version' => '13',
-            'sec-websocket-protocol' => 'mqtt',
-        ];
-
-        $response = $negotiator->negotiate($headers);
-        self::assertStringNotContainsString('Sec-WebSocket-Protocol', $response);
+        self::assertSame("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", HandshakeNegotiator::rejection(400));
+        self::assertSame("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", HandshakeNegotiator::rejection(403));
+        self::assertSame("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", HandshakeNegotiator::rejection(426));
+        self::assertSame("HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", HandshakeNegotiator::rejection(431));
+        self::assertSame(HandshakeNegotiator::rejection(400), HandshakeNegotiator::rejection(599), 'an unknown status becomes 400');
     }
 
-    // ── Exception Factories ──────────────────────────────────────────────
+    // ── Configuration ────────────────────────────────────────────────────
 
-    public function testHandshakeExceptionFactories(): void
+    #[Test]
+    public function theConfigurationIsValidated(): void
     {
-        $missing = HandshakeException::missingHeaders();
-        self::assertSame(400, $missing->httpStatusCode);
+        foreach ([
+            [WsCode::InvalidOrigin, static fn() => new HandshakeNegotiator(allowedOrigins: ['https://app.example.com/'])],
+            [WsCode::InvalidOrigin, static fn() => new HandshakeNegotiator(allowedOrigins: ['null'])],
+            [WsCode::InvalidSubprotocol, static fn() => new HandshakeNegotiator(subprotocols: ['chat v2'])],
+            [WsCode::NonPositiveLimit, static fn() => new HandshakeNegotiator(maxRequestSize: 0)],
+        ] as [$code, $build]) {
+            try {
+                $build();
+                self::fail('an invalid configuration was accepted');
+            } catch (InvalidConfigurationException $e) {
+                self::assertSame($code, $e->errorCode);
+            }
+        }
 
-        $invalidKey = HandshakeException::invalidKey();
-        self::assertSame(400, $invalidKey->httpStatusCode);
+        $negotiator = new HandshakeNegotiator(['https://a.example'], ['chat'], 1024);
+        self::assertSame(['https://a.example'], $negotiator->allowedOrigins);
+        self::assertSame(['chat'], $negotiator->subprotocols);
+        self::assertSame(1024, $negotiator->maxRequestSize);
+        self::assertSame(8192, (new HandshakeNegotiator())->maxRequestSize);
+        self::assertSame(1, (new HandshakeNegotiator(maxRequestSize: 1))->maxRequestSize);
+    }
 
-        $version = HandshakeException::unsupportedVersion('8');
-        self::assertSame(426, $version->httpStatusCode);
-        self::assertStringContainsString('8', $version->getMessage());
+    /**
+     * @param array<string, string|null> $headers
+     */
+    private static function request(HandshakeNegotiator $negotiator, array $headers): HandshakeRequest
+    {
+        return $negotiator->parseRequest(Client::handshake($headers));
+    }
 
-        $origin = HandshakeException::originRejected('https://evil.com');
-        self::assertSame(403, $origin->httpStatusCode);
+    private static function assertRefused(WsCode $code, int $status, \Closure $operation): void
+    {
+        try {
+            $operation();
+            self::fail('the handshake was accepted');
+        } catch (HandshakeException $e) {
+            self::assertSame($code, $e->errorCode);
+            self::assertSame($status, $e->status);
+        }
     }
 }

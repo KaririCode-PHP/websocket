@@ -4,204 +4,148 @@ declare(strict_types=1);
 
 namespace KaririCode\WebSocket\Tests\Unit\Frame;
 
-use KaririCode\WebSocket\Enum\Opcode;
+use KaririCode\WebSocket\Enum\CloseCode;
 use KaririCode\WebSocket\Exception\FrameException;
-use KaririCode\WebSocket\Exception\WebSocketException;
+use KaririCode\WebSocket\Exception\InvalidConfigurationException;
+use KaririCode\WebSocket\Exception\InvalidMessageException;
+use KaririCode\WebSocket\Exception\WsCode;
 use KaririCode\WebSocket\Frame\Frame;
 use KaririCode\WebSocket\Frame\MessageAssembler;
+use KaririCode\WebSocket\Message\Message;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
+#[CoversClass(MessageAssembler::class)]
+#[CoversClass(Message::class)]
 final class MessageAssemblerTest extends TestCase
 {
-    private MessageAssembler $assembler;
-
-    protected function setUp(): void
+    #[Test]
+    public function aFinalFrameIsAWholeMessage(): void
     {
-        $this->assembler = new MessageAssembler(maxMessageSize: 1024);
+        $assembler = new MessageAssembler();
+
+        $text = $assembler->feed(Frame::text('hello'));
+        $binary = $assembler->feed(Frame::binary("\x00\xFF"));
+
+        self::assertNotNull($text);
+        self::assertNotNull($binary);
+        self::assertTrue($text->isText());
+        self::assertSame('hello', $text->payload);
+        self::assertTrue($binary->isBinary());
+        self::assertSame("\x00\xFF", $binary->payload);
+        self::assertFalse($assembler->isAssembling());
     }
 
-    // ── Single-frame messages ────────────────────────────────────────────
-
-    public function testSingleTextFrame(): void
+    #[Test]
+    public function fragmentsAreJoinedAndUtf8IsCheckedOnTheWhole(): void
     {
-        $frame = new Frame(fin: true, opcode: Opcode::Text, payload: 'Hello');
-        $message = $this->assembler->feed($frame);
+        $assembler = new MessageAssembler();
+
+        self::assertNull($assembler->feed(Frame::text("ol\xC3", fin: false)));
+        self::assertTrue($assembler->isAssembling());
+        self::assertNull($assembler->feed(Frame::continuation('', fin: false)), 'an empty fragment is allowed');
+        $message = $assembler->feed(Frame::continuation("\xA1!"));
 
         self::assertNotNull($message);
+        self::assertSame('olá!', $message->payload);
         self::assertTrue($message->isText());
-        self::assertSame('Hello', $message->payload);
+        self::assertFalse($assembler->isAssembling());
+        self::assertSame('next', $assembler->feed(Frame::binary('next'))?->payload, 'the next message starts clean');
     }
 
-    public function testSingleBinaryFrame(): void
+    #[Test]
+    public function aFragmentedBinaryMessageStaysBinary(): void
     {
-        $frame = new Frame(fin: true, opcode: Opcode::Binary, payload: "\x00\x01");
-        $message = $this->assembler->feed($frame);
+        $assembler = new MessageAssembler();
+
+        self::assertNull($assembler->feed(Frame::binary('ab', fin: false)));
+        $message = $assembler->feed(Frame::continuation('cd'));
 
         self::assertNotNull($message);
         self::assertTrue($message->isBinary());
-        self::assertSame("\x00\x01", $message->payload);
+        self::assertSame('abcd', $message->payload);
     }
 
-    public function testEmptyTextFrame(): void
+    #[Test]
+    public function aContinuationWithoutMessageIsAProtocolError(): void
     {
-        $frame = new Frame(fin: true, opcode: Opcode::Text, payload: '');
-        $message = $this->assembler->feed($frame);
-
-        self::assertNotNull($message);
-        self::assertSame('', $message->payload);
+        self::assertFails(WsCode::UnexpectedContinuation, CloseCode::ProtocolError, new MessageAssembler(), Frame::continuation('x'));
     }
 
-    // ── Fragmented messages ──────────────────────────────────────────────
-
-    public function testTwoFragmentMessage(): void
+    #[Test]
+    public function aNewMessageInsideAnotherIsAProtocolError(): void
     {
-        $frag1 = new Frame(fin: false, opcode: Opcode::Text, payload: 'Hel');
-        $frag2 = new Frame(fin: true, opcode: Opcode::Continuation, payload: 'lo');
+        $assembler = new MessageAssembler();
+        $assembler->feed(Frame::text('a', fin: false));
 
-        self::assertNull($this->assembler->feed($frag1));
-        self::assertTrue($this->assembler->isFragmenting());
-
-        $message = $this->assembler->feed($frag2);
-        self::assertNotNull($message);
-        self::assertSame('Hello', $message->payload);
-        self::assertTrue($message->isText());
-        self::assertFalse($this->assembler->isFragmenting());
+        self::assertFails(WsCode::InterleavedDataFrame, CloseCode::ProtocolError, $assembler, Frame::binary('b'));
     }
 
-    public function testThreeFragmentMessage(): void
+    #[Test]
+    public function theLimitCountsEveryFragment(): void
     {
-        $frag1 = new Frame(fin: false, opcode: Opcode::Binary, payload: 'AA');
-        $frag2 = new Frame(fin: false, opcode: Opcode::Continuation, payload: 'BB');
-        $frag3 = new Frame(fin: true, opcode: Opcode::Continuation, payload: 'CC');
+        $assembler = new MessageAssembler(maxMessageSize: 10);
 
-        self::assertNull($this->assembler->feed($frag1));
-        self::assertNull($this->assembler->feed($frag2));
-
-        $message = $this->assembler->feed($frag3);
-        self::assertNotNull($message);
-        self::assertSame('AABBCC', $message->payload);
-        self::assertTrue($message->isBinary());
+        self::assertSame(10, $assembler->feed(Frame::binary(str_repeat('x', 10)))?->length());
+        self::assertNull($assembler->feed(Frame::binary(str_repeat('x', 6), fin: false)));
+        self::assertFails(WsCode::MessageTooLarge, CloseCode::MessageTooBig, $assembler, Frame::continuation(str_repeat('x', 5)));
+        self::assertFalse($assembler->isAssembling(), 'the partial message is dropped');
+        self::assertFails(WsCode::MessageTooLarge, CloseCode::MessageTooBig, new MessageAssembler(maxMessageSize: 10), Frame::text(str_repeat('t', 11)));
     }
 
-    // ── Control frames interleaved ───────────────────────────────────────
-
-    public function testControlFrameDuringFragmentation(): void
+    #[Test]
+    public function textThatIsNotUtf8IsInvalidPayload(): void
     {
-        $frag1 = new Frame(fin: false, opcode: Opcode::Text, payload: 'Hel');
+        $assembler = new MessageAssembler();
+        $assembler->feed(Frame::text("\xC3", fin: false));
 
-        // Ping interleaved
-        $ping = new Frame(fin: true, opcode: Opcode::Ping, payload: 'alive');
-
-        $frag2 = new Frame(fin: true, opcode: Opcode::Continuation, payload: 'lo');
-
-        self::assertNull($this->assembler->feed($frag1));
-
-        // Ping is returned immediately
-        $pingMsg = $this->assembler->feed($ping);
-        self::assertNotNull($pingMsg);
-        self::assertSame(Opcode::Ping, $pingMsg->opcode);
-        self::assertSame('alive', $pingMsg->payload);
-        self::assertTrue($this->assembler->isFragmenting());
-
-        // Fragmentation continues
-        $message = $this->assembler->feed($frag2);
-        self::assertNotNull($message);
-        self::assertSame('Hello', $message->payload);
+        self::assertFails(WsCode::InvalidUtf8, CloseCode::InvalidPayload, $assembler, Frame::continuation('x'));
+        self::assertFails(WsCode::InvalidUtf8, CloseCode::InvalidPayload, new MessageAssembler(), Frame::text("\xED\xA0\x80"));
+        self::assertSame("\xC3", (new MessageAssembler())->feed(Frame::binary("\xC3"))?->payload, 'binary carries any bytes');
     }
 
-    public function testCloseFrameReturnedImmediately(): void
+    #[Test]
+    public function controlFramesAreNotPartOfMessages(): void
     {
-        $close = new Frame(fin: true, opcode: Opcode::Close, payload: pack('n', 1000));
-        $message = $this->assembler->feed($close);
-
-        self::assertNotNull($message);
-        self::assertSame(Opcode::Close, $message->opcode);
+        try {
+            (new MessageAssembler())->feed(Frame::ping());
+            self::fail('a ping was assembled');
+        } catch (InvalidMessageException $e) {
+            self::assertSame(WsCode::ControlOpcodeInMessage, $e->errorCode);
+        }
     }
 
-    // ── Error conditions ─────────────────────────────────────────────────
-
-    public function testNewDataFrameDuringFragmentationThrows(): void
+    #[Test]
+    public function resetDropsThePartialMessage(): void
     {
-        $frag1 = new Frame(fin: false, opcode: Opcode::Text, payload: 'start');
-        $this->assembler->feed($frag1);
+        $assembler = new MessageAssembler();
+        $assembler->feed(Frame::text('a', fin: false));
+        $assembler->reset();
 
-        // New text frame before continuation completed
-        $illegal = new Frame(fin: true, opcode: Opcode::Text, payload: 'oops');
-
-        $this->expectException(WebSocketException::class);
-        $this->assembler->feed($illegal);
+        self::assertFalse($assembler->isAssembling());
+        self::assertSame('b', $assembler->feed(Frame::text('b'))?->payload);
     }
 
-    public function testContinuationWithoutPrecedingDataThrows(): void
+    #[Test]
+    public function theLimitDefaultsToTenMebibytesAndIsAtLeastOneByte(): void
     {
-        $orphan = new Frame(fin: true, opcode: Opcode::Continuation, payload: 'data');
+        self::assertSame(10_485_760, (new MessageAssembler())->maxMessageSize);
+        self::assertSame('x', (new MessageAssembler(maxMessageSize: 1))->feed(Frame::binary('x'))?->payload);
 
-        $this->expectException(WebSocketException::class);
-        $this->assembler->feed($orphan);
+        $this->expectException(InvalidConfigurationException::class);
+
+        new MessageAssembler(maxMessageSize: 0);
     }
 
-    public function testMessageTooLargeThrows(): void
+    private static function assertFails(WsCode $code, CloseCode $closeCode, MessageAssembler $assembler, Frame $frame): void
     {
-        $smallAssembler = new MessageAssembler(maxMessageSize: 10);
-
-        $frag1 = new Frame(fin: false, opcode: Opcode::Text, payload: str_repeat('A', 8));
-        $smallAssembler->feed($frag1);
-
-        $frag2 = new Frame(fin: true, opcode: Opcode::Continuation, payload: str_repeat('B', 8));
-
-        $this->expectException(FrameException::class);
-        $smallAssembler->feed($frag2);
-    }
-
-    public function testInvalidUtf8InTextFrameThrows(): void
-    {
-        $frame = new Frame(fin: true, opcode: Opcode::Text, payload: "\xFF\xFE");
-
-        $this->expectException(FrameException::class);
-        $this->assembler->feed($frame);
-    }
-
-    public function testInvalidUtf8InFragmentedTextThrows(): void
-    {
-        $frag1 = new Frame(fin: false, opcode: Opcode::Text, payload: 'valid');
-        $this->assembler->feed($frag1);
-
-        $frag2 = new Frame(fin: true, opcode: Opcode::Continuation, payload: "\xFF\xFE");
-
-        $this->expectException(FrameException::class);
-        $this->assembler->feed($frag2);
-    }
-
-    public function testBinaryFrameSkipsUtf8Validation(): void
-    {
-        $frame = new Frame(fin: true, opcode: Opcode::Binary, payload: "\xFF\xFE");
-        $message = $this->assembler->feed($frame);
-
-        self::assertNotNull($message);
-        self::assertSame("\xFF\xFE", $message->payload);
-    }
-
-    // ── Reset ────────────────────────────────────────────────────────────
-
-    public function testResetClearsFragmentState(): void
-    {
-        $frag = new Frame(fin: false, opcode: Opcode::Text, payload: 'partial');
-        $this->assembler->feed($frag);
-        self::assertTrue($this->assembler->isFragmenting());
-
-        $this->assembler->reset();
-        self::assertFalse($this->assembler->isFragmenting());
-    }
-
-    public function testMultipleMessagesSequentially(): void
-    {
-        $msg1 = new Frame(fin: true, opcode: Opcode::Text, payload: 'first');
-        $msg2 = new Frame(fin: true, opcode: Opcode::Text, payload: 'second');
-
-        $result1 = $this->assembler->feed($msg1);
-        $result2 = $this->assembler->feed($msg2);
-
-        self::assertSame('first', $result1->payload);
-        self::assertSame('second', $result2->payload);
+        try {
+            $assembler->feed($frame);
+            self::fail('the frame was assembled');
+        } catch (FrameException $e) {
+            self::assertSame($code, $e->errorCode);
+            self::assertSame($closeCode, $e->closeCode);
+        }
     }
 }

@@ -4,217 +4,231 @@ declare(strict_types=1);
 
 namespace KaririCode\WebSocket\Tests\Unit\Frame;
 
+use KaririCode\WebSocket\Enum\CloseCode;
 use KaririCode\WebSocket\Enum\Opcode;
 use KaririCode\WebSocket\Exception\FrameException;
+use KaririCode\WebSocket\Exception\InvalidConfigurationException;
+use KaririCode\WebSocket\Exception\WsCode;
+use KaririCode\WebSocket\Frame\Frame;
 use KaririCode\WebSocket\Frame\FrameParser;
+use KaririCode\WebSocket\Tests\Support\Client;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
+#[CoversClass(FrameParser::class)]
+#[CoversClass(Frame::class)]
+#[CoversClass(FrameException::class)]
 final class FrameParserTest extends TestCase
 {
-    private FrameParser $parser;
+    // ── Complete frames ──────────────────────────────────────────────────
 
-    protected function setUp(): void
+    #[Test]
+    public function aMaskedTextFrameIsUnmasked(): void
     {
-        // requireMask=false for simpler test frame construction
-        $this->parser = new FrameParser(maxPayloadSize: 65536, requireMask: false);
-    }
+        $result = (new FrameParser())->parse(Client::text('Hello'));
 
-    public function testParseSingleUnmaskedTextFrame(): void
-    {
-        // FIN=1, opcode=0x1 (text), MASK=0, length=5, payload="Hello"
-        $frame = chr(0x81) . chr(0x05) . 'Hello';
-
-        $result = $this->parser->parse($frame);
         self::assertNotNull($result);
-
-        [$parsed, $consumed] = $result;
-        self::assertTrue($parsed->fin);
-        self::assertSame(Opcode::Text, $parsed->opcode);
-        self::assertSame('Hello', $parsed->payload);
-        self::assertSame(7, $consumed);
+        [$frame, $used] = $result;
+        self::assertTrue($frame->fin);
+        self::assertSame(Opcode::Text, $frame->opcode);
+        self::assertSame('Hello', $frame->payload);
+        self::assertTrue($frame->masked);
+        self::assertSame(11, $used);
     }
 
-    public function testParseMaskedFrame(): void
+    #[Test]
+    public function theRfcExampleIsRead(): void
     {
-        $maskedParser = new FrameParser(requireMask: true);
-        $payload = 'Test';
-        $maskKey = "\x37\xfa\x21\x3d";
-        $maskedPayload = FrameParser::applyMask($payload, $maskKey);
+        // RFC 6455 §5.7: a single-frame masked text message "Hello".
+        $result = (new FrameParser())->parse("\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58");
 
-        // FIN=1, opcode=0x1, MASK=1, length=4
-        $frame = chr(0x81) . chr(0x84) . $maskKey . $maskedPayload;
-
-        $result = $maskedParser->parse($frame);
         self::assertNotNull($result);
-
-        [$parsed, $consumed] = $result;
-        self::assertSame('Test', $parsed->payload);
-        self::assertTrue($parsed->masked);
-        self::assertSame(10, $consumed);
+        self::assertSame('Hello', $result[0]->payload);
     }
 
-    public function testParseBinaryFrame(): void
+    /**
+     * @return iterable<string, array{int}>
+     */
+    public static function lengths(): iterable
     {
-        $payload = "\x00\x01\x02\x03";
-        $frame = chr(0x82) . chr(0x04) . $payload;
+        yield 'empty' => [0];
+        yield '125, the last 7-bit length' => [125];
+        yield '126, the first 16-bit length' => [126];
+        yield '65535, the last 16-bit length' => [65535];
+        yield '65536, the first 64-bit length' => [65536];
+    }
 
-        $result = $this->parser->parse($frame);
+    #[Test]
+    #[DataProvider('lengths')]
+    public function everyLengthEncodingIsRead(int $length): void
+    {
+        $payload = str_repeat('a', $length);
+        $bytes = Client::frame(0x2, $payload);
+
+        $result = (new FrameParser())->parse($bytes . 'next frame');
+
         self::assertNotNull($result);
-
-        [$parsed] = $result;
-        self::assertSame(Opcode::Binary, $parsed->opcode);
-        self::assertSame($payload, $parsed->payload);
+        self::assertSame($payload, $result[0]->payload);
+        self::assertSame(strlen($bytes), $result[1], 'the bytes after the frame are left for the next call');
     }
 
-    public function testParsePingFrame(): void
+    #[Test]
+    public function aLargeSixteenBitLengthIsNotMistakenForA64BitOne(): void
     {
-        $frame = chr(0x89) . chr(0x04) . 'ping';
+        $payload = str_repeat('b', 40000);
 
-        [$parsed] = $this->parser->parse($frame);
-        self::assertSame(Opcode::Ping, $parsed->opcode);
-        self::assertTrue($parsed->fin);
-        self::assertSame('ping', $parsed->payload);
+        $result = (new FrameParser())->parse(Client::frame(0x2, $payload));
+
+        self::assertSame($payload, $result[0]->payload ?? null);
     }
 
-    public function testParsePongFrame(): void
+    #[Test]
+    public function finAndContinuationAreKept(): void
     {
-        $frame = chr(0x8A) . chr(0x04) . 'pong';
+        $result = (new FrameParser())->parse(Client::frame(0x0, 'part', fin: false));
 
-        [$parsed] = $this->parser->parse($frame);
-        self::assertSame(Opcode::Pong, $parsed->opcode);
+        self::assertNotNull($result);
+        self::assertFalse($result[0]->fin);
+        self::assertSame(Opcode::Continuation, $result[0]->opcode);
     }
 
-    public function testParseCloseFrame(): void
+    #[Test]
+    public function finIsReadFromTheTopBitAlone(): void
     {
-        // Close with code 1000 + reason
-        $payload = pack('n', 1000) . 'Normal';
-        $frame = chr(0x88) . chr(strlen($payload)) . $payload;
+        $parser = new FrameParser();
 
-        [$parsed] = $this->parser->parse($frame);
-        self::assertSame(Opcode::Close, $parsed->opcode);
-        self::assertSame($payload, $parsed->payload);
+        self::assertFalse($parser->parse(Client::frame(0x1, 'start', fin: false))[0]->fin ?? true, 'the first fragment of a text message');
+        self::assertTrue($parser->parse(Client::frame(0x0, 'end'))[0]->fin ?? false, 'the last fragment');
     }
 
-    public function testParse16BitExtendedLength(): void
+    #[Test]
+    public function withoutTheMaskRequirementBothFormsAreRead(): void
     {
-        $payload = str_repeat('A', 300);
-        $frame = chr(0x81) . chr(126) . pack('n', 300) . $payload;
+        $parser = new FrameParser(requireMask: false);
 
-        [$parsed, $consumed] = $this->parser->parse($frame);
-        self::assertSame(300, $parsed->payloadLength());
-        self::assertSame(304, $consumed); // 2 + 2 + 300
+        self::assertSame('plain', $parser->parse(Client::frame(0x1, 'plain', masked: false))[0]->payload ?? null);
+        self::assertFalse($parser->parse(Client::frame(0x1, 'plain', masked: false))[0]->masked ?? true);
+        self::assertSame('masked', $parser->parse(Client::text('masked'))[0]->payload ?? null);
+        self::assertSame(1048576, $parser->maxPayloadSize);
     }
 
-    public function testParse64BitExtendedLength(): void
-    {
-        $payload = str_repeat('B', 65536);
-        $frame = chr(0x81) . chr(127) . pack('J', 65536) . $payload;
+    // ── Incomplete frames ────────────────────────────────────────────────
 
-        [$parsed, $consumed] = $this->parser->parse($frame);
-        self::assertSame(65536, $parsed->payloadLength());
-        self::assertSame(65546, $consumed); // 2 + 8 + 65536
+    #[Test]
+    public function anIncompleteFrameWaitsForMoreBytes(): void
+    {
+        $parser = new FrameParser();
+        $short = Client::text('Hello');
+        $medium = Client::frame(0x2, str_repeat('m', 300));
+        $long = Client::frame(0x2, str_repeat('l', 70000));
+
+        foreach ([$short, $medium, $long] as $bytes) {
+            for ($cut = 0; $cut < strlen($bytes); $cut += max(1, intdiv(strlen($bytes), 40))) {
+                self::assertNull($parser->parse(substr($bytes, 0, $cut)), 'cut at ' . $cut);
+            }
+
+            self::assertNull($parser->parse(substr($bytes, 0, -1)));
+            self::assertNotNull($parser->parse($bytes));
+        }
+
+        foreach ([1, 2, 3, 4, 5, 9, 10, 11, 13] as $cut) {
+            self::assertNull($parser->parse(substr($long, 0, $cut)), 'header cut at ' . $cut);
+        }
     }
 
-    public function testIncompleteFrameReturnsNull(): void
-    {
-        // Only 1 byte — need at least 2
-        self::assertNull($this->parser->parse(chr(0x81)));
+    // ── Header rules ─────────────────────────────────────────────────────
 
-        // Header says 5 bytes but only 3 available
-        self::assertNull($this->parser->parse(chr(0x81) . chr(0x05) . 'He'));
+    /**
+     * @return iterable<string, array{string, WsCode, CloseCode}>
+     */
+    public static function violations(): iterable
+    {
+        yield 'RSV1' => [Client::frame(0x1, 'x', rsv: 4), WsCode::ReservedBits, CloseCode::ProtocolError];
+        yield 'RSV2' => [Client::frame(0x1, 'x', rsv: 2), WsCode::ReservedBits, CloseCode::ProtocolError];
+        yield 'RSV3' => [Client::frame(0x1, 'x', rsv: 1), WsCode::ReservedBits, CloseCode::ProtocolError];
+        yield 'opcode 0x3' => [Client::frame(0x3), WsCode::ReservedOpcode, CloseCode::ProtocolError];
+        yield 'opcode 0x7' => [Client::frame(0x7), WsCode::ReservedOpcode, CloseCode::ProtocolError];
+        yield 'opcode 0xB' => [Client::frame(0xB), WsCode::ReservedOpcode, CloseCode::ProtocolError];
+        yield 'opcode 0xF' => [Client::frame(0xF), WsCode::ReservedOpcode, CloseCode::ProtocolError];
+        yield 'unmasked text' => [Client::frame(0x1, 'x', masked: false), WsCode::UnmaskedClientFrame, CloseCode::ProtocolError];
+        yield 'unmasked close' => [Client::frame(0x8, '', masked: false), WsCode::UnmaskedClientFrame, CloseCode::ProtocolError];
+        yield 'fragmented ping' => [Client::frame(0x9, 'x', fin: false), WsCode::FragmentedControlFrame, CloseCode::ProtocolError];
+        yield 'fragmented close' => [Client::frame(0x8, '', fin: false), WsCode::FragmentedControlFrame, CloseCode::ProtocolError];
+        yield 'ping of 126 bytes' => [Client::frame(0x9, str_repeat('p', 126)), WsCode::ControlFrameTooLarge, CloseCode::ProtocolError];
+        yield 'pong declaring 127' => [substr(Client::frame(0xA, str_repeat('p', 70000)), 0, 2), WsCode::ControlFrameTooLarge, CloseCode::ProtocolError];
+        yield '16-bit length of 125' => [Client::frame(0x2, str_repeat('n', 125), length: 126), WsCode::NonMinimalLength, CloseCode::ProtocolError];
+        yield '16-bit length of 0' => [Client::frame(0x2, '', length: 126), WsCode::NonMinimalLength, CloseCode::ProtocolError];
+        yield '64-bit length of 65535' => [Client::frame(0x2, str_repeat('n', 65535), length: 127), WsCode::NonMinimalLength, CloseCode::ProtocolError];
+        yield '64-bit length of 126' => [Client::frame(0x2, str_repeat('n', 126), length: 127), WsCode::NonMinimalLength, CloseCode::ProtocolError];
+        yield '64-bit length with the top bit set' => ["\x82\xFF\x80\x00\x00\x00\x00\x00\x00\x05", WsCode::LengthOutOfRange, CloseCode::ProtocolError];
     }
 
-    public function testEmptyBufferReturnsNull(): void
+    #[Test]
+    #[DataProvider('violations')]
+    public function aBrokenRuleFailsWithItsCodeAndCloseCode(string $bytes, WsCode $code, CloseCode $closeCode): void
     {
-        self::assertNull($this->parser->parse(''));
+        try {
+            (new FrameParser())->parse($bytes);
+            self::fail('the frame was accepted');
+        } catch (FrameException $e) {
+            self::assertSame($code, $e->errorCode);
+            self::assertSame($closeCode, $e->closeCode);
+        }
     }
 
-    public function testReservedOpcodeThrows(): void
+    #[Test]
+    public function theLimitIsEnforcedBeforeThePayloadArrives(): void
     {
-        // opcode 0x3 is reserved
-        $frame = chr(0x83) . chr(0x00);
+        $parser = new FrameParser(maxPayloadSize: 100);
+        $declared = substr(Client::frame(0x2, str_repeat('x', 70000)), 0, 10);
+        $huge = "\x82\xFF\x01\x00\x00\x00\x00\x00\x00\x00";   // 2^56: in range, far above the limit
 
-        $this->expectException(FrameException::class);
-        $this->parser->parse($frame);
+        self::assertNotNull($parser->parse(Client::frame(0x2, str_repeat('x', 100))));
+
+        foreach ([Client::frame(0x2, str_repeat('x', 101)), $declared, $huge] as $bytes) {
+            try {
+                $parser->parse($bytes);
+                self::fail('a frame above the limit was accepted');
+            } catch (FrameException $e) {
+                self::assertSame(WsCode::FrameTooLarge, $e->errorCode);
+                self::assertSame(CloseCode::MessageTooBig, $e->closeCode);
+            }
+        }
     }
 
-    public function testControlFrameTooLargeThrows(): void
+    #[Test]
+    public function aControlFrameWithinTheLimitsIsRead(): void
     {
-        // Ping with 126 bytes payload (exceeds 125 limit)
-        $frame = chr(0x89) . chr(126) . pack('n', 126) . str_repeat('X', 126);
+        $result = (new FrameParser())->parse(Client::frame(0x9, str_repeat('p', 125)));
 
-        $this->expectException(FrameException::class);
-        $this->parser->parse($frame);
+        self::assertNotNull($result);
+        self::assertSame(Opcode::Ping, $result[0]->opcode);
+        self::assertSame(125, $result[0]->length());
     }
 
-    public function testFragmentedControlFrameThrows(): void
+    #[Test]
+    public function theLimitIsAtLeastOneByte(): void
     {
-        // Ping with FIN=0 (fragmentation not allowed for control)
-        $frame = chr(0x09) . chr(0x04) . 'ping';
+        self::assertSame('a', (new FrameParser(maxPayloadSize: 1))->parse(Client::frame(0x2, 'a'))[0]->payload ?? null);
 
-        $this->expectException(FrameException::class);
-        $this->parser->parse($frame);
+        $this->expectException(InvalidConfigurationException::class);
+
+        new FrameParser(maxPayloadSize: 0);
     }
 
-    public function testPayloadTooLargeThrows(): void
+    // ── Masking ──────────────────────────────────────────────────────────
+
+    #[Test]
+    public function maskingIsItsOwnInverse(): void
     {
-        $smallParser = new FrameParser(maxPayloadSize: 10, requireMask: false);
-        $frame = chr(0x81) . chr(0x14) . str_repeat('X', 20);
+        foreach (['', 'a', 'abcd', 'abcde', str_repeat('xyz', 1000)] as $data) {
+            $masked = FrameParser::applyMask($data, Client::MASK);
 
-        $this->expectException(FrameException::class);
-        $smallParser->parse($frame);
-    }
-
-    public function testMaskRequired(): void
-    {
-        $strictParser = new FrameParser(requireMask: true);
-        // Unmasked frame
-        $frame = chr(0x81) . chr(0x05) . 'Hello';
-
-        $this->expectException(FrameException::class);
-        $strictParser->parse($frame);
-    }
-
-    public function testApplyMaskIsSelfInverse(): void
-    {
-        $data = 'Hello, WebSocket!';
-        $key = "\xAB\xCD\xEF\x01";
-
-        $masked = FrameParser::applyMask($data, $key);
-        self::assertNotSame($data, $masked);
-
-        $unmasked = FrameParser::applyMask($masked, $key);
-        self::assertSame($data, $unmasked);
-    }
-
-    public function testParseFragmentedFrames(): void
-    {
-        // First fragment: FIN=0, opcode=Text
-        $frame1 = chr(0x01) . chr(0x03) . 'Hel';
-        // Continuation: FIN=0, opcode=Continuation
-        $frame2 = chr(0x00) . chr(0x02) . 'lo';
-        // Final: FIN=1, opcode=Continuation
-        $frame3 = chr(0x80) . chr(0x01) . '!';
-
-        [$parsed1] = $this->parser->parse($frame1);
-        self::assertFalse($parsed1->fin);
-        self::assertSame(Opcode::Text, $parsed1->opcode);
-
-        [$parsed2] = $this->parser->parse($frame2);
-        self::assertFalse($parsed2->fin);
-        self::assertSame(Opcode::Continuation, $parsed2->opcode);
-
-        [$parsed3] = $this->parser->parse($frame3);
-        self::assertTrue($parsed3->fin);
-        self::assertSame(Opcode::Continuation, $parsed3->opcode);
-    }
-
-    public function testNonZeroRsvThrows(): void
-    {
-        // RSV1 set: byte0 = 0xC1 (FIN + RSV1 + Text)
-        $frame = chr(0xC1) . chr(0x01) . 'X';
-
-        $this->expectException(\KaririCode\WebSocket\Exception\WebSocketException::class);
-        $this->parser->parse($frame);
+            self::assertSame(Client::mask($data), $masked);
+            self::assertSame($data, FrameParser::applyMask($masked, Client::MASK));
+            self::assertSame(strlen($data), strlen($masked));
+        }
     }
 }
