@@ -1,0 +1,17 @@
+{
+    "$schema": ".kcode/vendor/infection/infection/resources/schema.json",
+    // KaririCode Spec V4.3.3 §19.4 and §29.1: MSI >= 80%.
+    "source": { "directories": ["src"] },
+    "timeout": 10,
+    "phpUnit": {
+        "customPath": ".kcode/vendor/bin/phpunit"
+    },
+    "logs": {
+        "text": "build/infection/infection.log",
+        "summary": "build/infection/summary.log"
+    },
+    "mutators": { "@default": true },
+    "minMsi": 80,
+    "minCoveredMsi": 80,
+    "testFramework": "phpunit"
+}

@@ -1,0 +1,23 @@
+includes:
+    # Spec V4.3.3 §13: cognitive complexity <= 15 per method; kcode installs
+    # the rule with the toolchain (devkit.php).
+    - .kcode/vendor/tomasvotruba/cognitive-complexity/config/extension.neon
+
+parameters:
+    level: max
+    phpVersion: 80400
+    paths:
+        - src
+        - tests
+        - tools
+    # kcode installs these into .kcode/ (ADR-006): PHPUnit for the tests and
+    # nikic/php-parser for tools/complexity.php.
+    scanDirectories:
+        - .kcode/vendor/phpunit/phpunit/src
+        - .kcode/vendor/nikic/php-parser/lib
+    treatPhpDocTypesAsCertain: false
+    cognitive_complexity:
+        function: 15
+        class: 1000
+        dependency_tree: 1000
+        dependency_tree_types: []

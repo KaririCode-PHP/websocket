@@ -1,0 +1,577 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "2929e6f5b90c7340a0c47b11dcbe612c",
+    "packages": [
+        {
+            "name": "kariricode/contract",
+            "version": "v2.12.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/KaririCode-PHP/contract.git",
+                "reference": "6ba79c820f810c451856bee67dabc5443f0782a5"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/KaririCode-PHP/contract/zipball/6ba79c820f810c451856bee67dabc5443f0782a5",
+                "reference": "6ba79c820f810c451856bee67dabc5443f0782a5",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^8.4"
+            },
+            "type": "library",
+            "extra": {
+                "arfa": {
+                    "level": 1,
+                    "version": "1.3"
+                },
+                "asvs": {
+                    "level": 1,
+                    "version": "5.0"
+                },
+                "branch-alias": {
+                    "dev-main": "2.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "KaririCode\\Contract\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Walmir Silva",
+                    "email": "walmir.silva@kariricode.org"
+                }
+            ],
+            "description": "Interfaces shared by KaririCode Framework components, so that components depend on contracts instead of on each other. Interfaces only; no runtime dependency beyond PHP.",
+            "homepage": "https://kariricode.org/",
+            "keywords": [
+                "KaririCode",
+                "PSRs",
+                "arfa",
+                "contract",
+                "framework",
+                "interface",
+                "kariri",
+                "php"
+            ],
+            "support": {
+                "issues": "https://github.com/KaririCode-Framework/kariricode-contract/issues",
+                "source": "https://github.com/KaririCode-Framework/kariricode-contract"
+            },
+            "time": "2026-11-27T12:43:04+00:00"
+        },
+        {
+            "name": "kariricode/exception",
+            "version": "v2.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/KaririCode-PHP/exception.git",
+                "reference": "052cebd56000b539b8a56262db7cb6516124e858"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/KaririCode-PHP/exception/zipball/052cebd56000b539b8a56262db7cb6516124e858",
+                "reference": "052cebd56000b539b8a56262db7cb6516124e858",
+                "shasum": ""
+            },
+            "require": {
+                "kariricode/contract": "^2.11",
+                "php": "^8.4"
+            },
+            "type": "library",
+            "extra": {
+                "arfa": {
+                    "level": 1,
+                    "version": "1.3"
+                },
+                "asvs": {
+                    "level": 1,
+                    "version": "5.0"
+                },
+                "branch-alias": {
+                    "dev-main": "2.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "KaririCode\\Exception\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Walmir Silva",
+                    "email": "walmir.silva@kariricode.org"
+                }
+            ],
+            "description": "Optional base classes for the exception families of kariricode/contract: one abstract base per family, error codes as int-backed enums inside registered blocks, and messages that are safe to log.",
+            "homepage": "https://kariricode.org/",
+            "keywords": [
+                "KaririCode",
+                "arfa",
+                "contract",
+                "error-codes",
+                "exception",
+                "php84"
+            ],
+            "support": {
+                "issues": "https://github.com/KaririCode-PHP/exception/issues",
+                "source": "https://github.com/KaririCode-PHP/exception"
+            },
+            "time": "2026-11-27T15:11:21+00:00"
+        },
+        {
+            "name": "kariricode/http",
+            "version": "v4.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/KaririCode-PHP/http.git",
+                "reference": "0518365ef0d063baa735786dc10f75c8d16e21f3"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/KaririCode-PHP/http/zipball/0518365ef0d063baa735786dc10f75c8d16e21f3",
+                "reference": "0518365ef0d063baa735786dc10f75c8d16e21f3",
+                "shasum": ""
+            },
+            "require": {
+                "kariricode/exception": "^2.0.2",
+                "kariricode/router": "^4.1",
+                "php": "^8.4",
+                "psr/clock": "^1.0",
+                "psr/http-factory": "^1.1",
+                "psr/http-message": "^2.0",
+                "psr/http-server-handler": "^1.0",
+                "psr/http-server-middleware": "^1.0"
+            },
+            "provide": {
+                "psr/http-factory-implementation": "1.0",
+                "psr/http-message-implementation": "2.0",
+                "psr/http-server-handler-implementation": "1.0",
+                "psr/http-server-middleware-implementation": "1.0"
+            },
+            "suggest": {
+                "ext-openssl": "ClientCertificate::fromOpenSslCertificate() and fingerprints computed from a forwarded PEM certificate"
+            },
+            "type": "library",
+            "extra": {
+                "kariricode": {
+                    "arfa": {
+                        "level": 1,
+                        "version": "1.3"
+                    },
+                    "asvs": {
+                        "level": 1,
+                        "version": "5.0"
+                    },
+                    "spec": "4.3.3",
+                    "error-code-range": "HTTP 1700–1799"
+                },
+                "branch-alias": {
+                    "dev-main": "4.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "KaririCode\\Http\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Walmir Silva",
+                    "email": "walmir.silva@kariricode.org",
+                    "homepage": "https://kariricode.org",
+                    "role": "Lead Architect"
+                }
+            ],
+            "description": "PSR-7, PSR-15 and PSR-17 for PHP 8.4: validated messages, a middleware dispatcher, CORS and client-certificate middleware, and a request handler backed by kariricode/router.",
+            "homepage": "https://github.com/KaririCode-PHP/http",
+            "keywords": [
+                "KaririCode",
+                "cors",
+                "http",
+                "middleware",
+                "mtls",
+                "psr-15",
+                "psr-17",
+                "psr-7",
+                "router"
+            ],
+            "support": {
+                "issues": "https://github.com/KaririCode-PHP/http/issues",
+                "security": "https://github.com/KaririCode-PHP/http/security/policy",
+                "source": "https://github.com/KaririCode-PHP/http"
+            },
+            "time": "2026-11-27T16:36:40+00:00"
+        },
+        {
+            "name": "kariricode/router",
+            "version": "v4.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/KaririCode-PHP/router.git",
+                "reference": "d2c8370eb03e99b78aa1ffab0b4eba37770c062b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/KaririCode-PHP/router/zipball/d2c8370eb03e99b78aa1ffab0b4eba37770c062b",
+                "reference": "d2c8370eb03e99b78aa1ffab0b4eba37770c062b",
+                "shasum": ""
+            },
+            "require": {
+                "kariricode/exception": "^2.0",
+                "php": "^8.4"
+            },
+            "suggest": {
+                "psr/event-dispatcher": "For Integration\\EventDispatcherBridge, which publishes match outcomes as PSR-14 events",
+                "psr/simple-cache": "For Integration\\SimpleCacheStore, which keeps the compiled route table in a PSR-16 cache"
+            },
+            "type": "library",
+            "extra": {
+                "kariricode": {
+                    "arfa": {
+                        "level": 1,
+                        "version": "1.3"
+                    },
+                    "asvs": {
+                        "level": 1,
+                        "version": "5.0"
+                    },
+                    "spec": "4.3.3",
+                    "error-code-range": "RO 5000–5099"
+                },
+                "branch-alias": {
+                    "dev-main": "4.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "KaririCode\\Router\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Walmir Silva",
+                    "email": "walmir.silva@kariricode.org"
+                }
+            ],
+            "description": "Protocol-agnostic routing engine for PHP 8.4+: static routes in a hash map, parameterized routes in chunked PCRE with MARK verbs, typed parameter constraints, attribute and array route loading, URL generation and an OPcache-friendly compiled route table.",
+            "homepage": "https://kariricode.org/",
+            "keywords": [
+                "KaririCode",
+                "arfa",
+                "php84",
+                "protocol-agnostic",
+                "router",
+                "routing",
+                "url-generator"
+            ],
+            "support": {
+                "issues": "https://github.com/KaririCode-PHP/router/issues",
+                "source": "https://github.com/KaririCode-PHP/router"
+            },
+            "time": "2026-11-27T12:44:09+00:00"
+        },
+        {
+            "name": "psr/clock",
+            "version": "1.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/clock.git",
+                "reference": "e41a24703d4560fd0acb709162f73b8adfc3aa0d"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/clock/zipball/e41a24703d4560fd0acb709162f73b8adfc3aa0d",
+                "reference": "e41a24703d4560fd0acb709162f73b8adfc3aa0d",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.0 || ^8.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Clock\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for reading the clock.",
+            "homepage": "https://github.com/php-fig/clock",
+            "keywords": [
+                "clock",
+                "now",
+                "psr",
+                "psr-20",
+                "time"
+            ],
+            "support": {
+                "issues": "https://github.com/php-fig/clock/issues",
+                "source": "https://github.com/php-fig/clock/tree/1.0.0"
+            },
+            "time": "2022-11-25T14:36:26+00:00"
+        },
+        {
+            "name": "psr/http-factory",
+            "version": "1.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-factory.git",
+                "reference": "2b4765fddfe3b508ac62f829e852b1501d3f6e8a"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-factory/zipball/2b4765fddfe3b508ac62f829e852b1501d3f6e8a",
+                "reference": "2b4765fddfe3b508ac62f829e852b1501d3f6e8a",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.1",
+                "psr/http-message": "^1.0 || ^2.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Message\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "PSR-17: Common interfaces for PSR-7 HTTP message factories",
+            "keywords": [
+                "factory",
+                "http",
+                "message",
+                "psr",
+                "psr-17",
+                "psr-7",
+                "request",
+                "response"
+            ],
+            "support": {
+                "source": "https://github.com/php-fig/http-factory"
+            },
+            "time": "2024-04-15T12:06:14+00:00"
+        },
+        {
+            "name": "psr/http-message",
+            "version": "2.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-message.git",
+                "reference": "402d35bcb92c70c026d1a6a9883f06b2ead23d71"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-message/zipball/402d35bcb92c70c026d1a6a9883f06b2ead23d71",
+                "reference": "402d35bcb92c70c026d1a6a9883f06b2ead23d71",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.2 || ^8.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Message\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for HTTP messages",
+            "homepage": "https://github.com/php-fig/http-message",
+            "keywords": [
+                "http",
+                "http-message",
+                "psr",
+                "psr-7",
+                "request",
+                "response"
+            ],
+            "support": {
+                "source": "https://github.com/php-fig/http-message/tree/2.0"
+            },
+            "time": "2023-04-04T09:54:51+00:00"
+        },
+        {
+            "name": "psr/http-server-handler",
+            "version": "1.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-server-handler.git",
+                "reference": "84c4fb66179be4caaf8e97bd239203245302e7d4"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-server-handler/zipball/84c4fb66179be4caaf8e97bd239203245302e7d4",
+                "reference": "84c4fb66179be4caaf8e97bd239203245302e7d4",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.0",
+                "psr/http-message": "^1.0 || ^2.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Server\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for HTTP server-side request handler",
+            "keywords": [
+                "handler",
+                "http",
+                "http-interop",
+                "psr",
+                "psr-15",
+                "psr-7",
+                "request",
+                "response",
+                "server"
+            ],
+            "support": {
+                "source": "https://github.com/php-fig/http-server-handler/tree/1.0.2"
+            },
+            "time": "2023-04-10T20:06:20+00:00"
+        },
+        {
+            "name": "psr/http-server-middleware",
+            "version": "1.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-server-middleware.git",
+                "reference": "c1481f747daaa6a0782775cd6a8c26a1bf4a3829"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-server-middleware/zipball/c1481f747daaa6a0782775cd6a8c26a1bf4a3829",
+                "reference": "c1481f747daaa6a0782775cd6a8c26a1bf4a3829",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.0",
+                "psr/http-message": "^1.0 || ^2.0",
+                "psr/http-server-handler": "^1.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Server\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for HTTP server-side middleware",
+            "keywords": [
+                "http",
+                "http-interop",
+                "middleware",
+                "psr",
+                "psr-15",
+                "psr-7",
+                "request",
+                "response"
+            ],
+            "support": {
+                "issues": "https://github.com/php-fig/http-server-middleware/issues",
+                "source": "https://github.com/php-fig/http-server-middleware/tree/1.0.2"
+            },
+            "time": "2023-04-11T06:14:47+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": true,
+    "prefer-lowest": false,
+    "platform": {
+        "php": "^8.4"
+    },
+    "platform-dev": {},
+    "plugin-api-version": "2.6.0"
+}
