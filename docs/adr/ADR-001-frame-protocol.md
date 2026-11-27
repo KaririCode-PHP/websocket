@@ -1,69 +1,85 @@
-# ADR-001: RFC 6455 Frame Protocol Implementation
+# ADR-001 — Frame Protocol: Strict Parsing, Shortest Encoding, Bounded Messages
 
-## Status
-
-Accepted — V4.0.0
-
-## Date
-
-2026-03-03
+**Status:** Accepted
+**Date:** 2026-11-27 (first written 2026-03-03)
 
 ## Context
 
-WebSocket communication uses a binary frame protocol defined in RFC 6455 §5. Each frame carries an opcode (text, binary, close, ping, pong), masking key (client→server only), and variable-length payload. A robust implementation must handle:
+RFC 6455 §5 frames every message: two header bytes (FIN, three reserved
+bits, opcode, mask bit, a 7-bit length), an optional 16- or 64-bit length, a
+4-byte masking key on client frames, then the payload. A server parses bytes
+an untrusted client chose, so each rule of §5 is also a defence.
 
-- Extended payload lengths (7-bit, 16-bit, 64-bit)
-- Client-to-server masking enforcement (RFC 6455 §5.1)
-- Control frame constraints (≤125 bytes, no fragmentation)
-- Message fragmentation and reassembly
-- UTF-8 validation for text frames
-
-### Prior Art
-
-- **Ratchet/RFC6455** — mature PHP frame parser, but coupled to Ratchet's event loop.
-- **Textalk/websocket** — simple client, no server-side frame parsing.
-- **Swoole** — C-extension with built-in WebSocket, not portable.
+The reviewed 4.0 (kariricode-websocket-v4.0, 2026-03-03) read the 64-bit
+length with `unpack('J')`: a length with the top bit set came out negative,
+passed the size check and desynchronised the stream. It accepted lengths in
+a longer encoding than needed, unmasked the payload byte by byte in a PHP
+loop, checked UTF-8 with `mb_check_encoding()` without declaring
+ext-mbstring, and turned any Close payload into a code and reason without
+checking either.
 
 ## Decision
 
-Implement a standalone `FrameParser` and `FrameWriter` pair that operate on raw byte buffers:
-
-### FrameParser
-
-Reads a byte buffer and returns a `Frame` value object (or null if incomplete). Enforces:
-
-- Mask requirement (configurable, default: required for client→server)
-- Maximum payload length (configurable, default: 1 MB)
-- Control frame constraints (≤125 bytes, must be FIN)
-- Reserved opcode rejection
-- UTF-8 validation for text frames (opcode 0x1)
-
-### FrameWriter
-
-Serializes a `Frame` to bytes with optional masking. Produces the correct extended payload length encoding based on payload size.
-
-### XOR Masking (RFC 6455 §5.3)
-
-The `applyMask()` function XORs payload bytes against a 4-byte masking key. XOR is self-inverse, so the same function masks and unmasks. The implementation uses byte-level iteration (not `str_repeat` + XOR) for correctness on arbitrary-length payloads.
-
-### Message Assembly
-
-`MessageAssembler` reassembles fragmented messages from continuation frames (opcode 0x0) until a FIN frame arrives. It tracks the original opcode (text or binary) and concatenates payloads.
+- `FrameParser::parse(string $buffer)` returns the frame and the number of
+  bytes it used, or null while the frame is incomplete; the caller keeps
+  the rest of the buffer, so frames that arrive together are all read.
+- Each header rule is checked as soon as its bytes are there, before the
+  payload: reserved bits zero (no extension is negotiated, 1801), known
+  opcode (1800), mask set on client frames (1802), control frames final
+  (1804) and at most 125 bytes (1803), a 16-bit length of at least 126 and a
+  64-bit length of at least 65536 (1806) with the top bit clear (1807). All
+  of these fail the connection with 1002.
+- The payload limit (`maxPayloadSize`, 1 MiB by default) is compared with
+  the declared length, so a frame above it fails with 1009 (1805) before any
+  of its payload is buffered.
+- Unmasking XORs the payload with the key padded to its length
+  (`str_pad('', strlen($data), $key)`); the same call masks.
+- `FrameWriter` writes server frames unmasked (§5.1) with the shortest
+  length encoding.
+- `Frame` is a final readonly value. Its constructor refuses a control frame
+  that is not final or carries more than 125 bytes (1844), and
+  `Frame::close()` takes only codes an endpoint may send (1000–1003,
+  1007–1014, 3000–4999; 1843) and a UTF-8 reason of at most 123 bytes
+  (1841, 1842).
+- `MessageAssembler` joins fragments: a continuation without a message
+  (1809) and a new message inside one (1810) fail with 1002; the limit
+  (`maxMessageSize`, 10 MiB) counts every fragment and drops the partial
+  message (1808, close code 1009); UTF-8 is checked once on the whole text
+  message, because a fragment may end inside a sequence (1811, close code
+  1007). Control frames never enter it (1845).
+- `ClosePayload::parse()` reads a received Close: an empty payload has no
+  code (reported as 1005), one byte is a protocol error (1812), the code
+  must be one a peer may send (1813) and the reason UTF-8 (1814, close code
+  1007).
+- `FrameException` carries the close code its rule demands (§7.4.1), so
+  the session closes with the right one without a table of its own.
 
 ## Consequences
 
-### Positive
+- A malformed header fails the connection with the close code RFC 6455
+  names; nothing reads past it.
+- A client cannot make the server hold more than `maxPayloadSize` for one
+  frame or `maxMessageSize` for one message.
+- Messages are held whole until their last fragment; streaming a message to
+  the handler is not supported.
+- permessage-deflate (RFC 7692) is not supported: reserved bits must be
+  zero.
 
-- Standalone parser works with any I/O layer (stream_socket, Swoole, ReactPHP).
-- Configurable constraints allow tuning for different use cases (small IoT frames vs. large binary transfers).
-- Frame-level API enables custom protocols on top of WebSocket (subprotocol negotiation).
+## Alternatives Considered
 
-### Negative
-
-- Byte-level parsing in PHP is slower than C extensions. For extreme throughput, Swoole's built-in parser is faster.
-- Memory allocation for large payloads is a concern — streaming frame parsing is a future enhancement.
+- **Per-byte unmasking (the reviewed code).** Rejected: a PHP loop per byte;
+  string XOR runs in C.
+- **UTF-8 checked per fragment.** Rejected: §5.6 lets a fragment end inside
+  a code point; only the whole message has to be valid.
+- **`mb_check_encoding()`.** Rejected: it needs ext-mbstring;
+  `preg_match('//u')` uses PCRE, which every PHP build has, and refuses
+  overlong forms and surrogates as RFC 3629 does.
+- **permessage-deflate now.** Deferred: it adds a negotiation and needs
+  limits on the inflated size.
 
 ## References
 
-- RFC 6455 §5: https://datatracker.ietf.org/doc/html/rfc6455#section-5
-- ARFA 1.3 — P1 (Immutable State): Frame is `final readonly`
+- RFC 6455 §5.1–§5.8 (framing), §7.4 (status codes), §8.1 (UTF-8), §10.4
+  (limits).
+- RFC 3629 (UTF-8).
+- https://www.rfc-editor.org/rfc/rfc6455#section-5
