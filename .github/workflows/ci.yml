@@ -1,0 +1,108 @@
+# KaririCode Spec V4.3.3 gates (§29.1, §32) through KaririCode Devkit with
+# the root configs (ADR-006). Actions are pinned by commit SHA, with the
+# release they resolve to in a comment; kcode is pinned by version and
+# SHA-256, and devkit.php pins the tools it installs.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KCODE_VERSION: 1.2.1
+  KCODE_SHA256: 1bc43b06798b4e7fc1df341cc505f316549f0dd5efb9c8d80031415b0cdf3e3b
+
+jobs:
+  gates:
+    name: Gates (PHP 8.4)
+    runs-on: ubuntu-24.04
+    env:
+      COMPOSER_ROOT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev-main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.4'
+          coverage: pcov
+          tools: none
+
+      - name: Validate composer.json and the committed lock file
+        run: composer validate --strict
+
+      - name: Install the runtime (kariricode/exception, http, router and their dependencies)
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Install kcode ${{ env.KCODE_VERSION }}, checksum verified
+        run: |
+          curl -fsSLo kcode.phar "https://github.com/KaririCode-PHP/devkit/releases/download/v${KCODE_VERSION}/kcode.phar"
+          echo "${KCODE_SHA256}  kcode.phar" | sha256sum -c -
+          sudo install -m 0755 kcode.phar /usr/local/bin/kcode
+
+      - name: Install the toolchain pinned in devkit.php
+        run: kcode init
+
+      - name: Style, PHPStan max, Psalm 1, complexity, the suites, mutation
+        run: composer check
+
+      - name: Known vulnerabilities and secret scan
+        run: composer security
+
+      - name: SBOM (CycloneDX 1.5)
+        run: composer sbom
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+  lowest:
+    name: Tests (PHP 8.5, lowest dependencies)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.5'
+          coverage: none
+          tools: none
+
+      - name: Resolve the lowest versions the constraints allow
+        run: composer update --prefer-lowest --no-interaction --no-progress --prefer-dist
+
+      - name: Install kcode ${{ env.KCODE_VERSION }}, checksum verified
+        run: |
+          curl -fsSLo kcode.phar "https://github.com/KaririCode-PHP/devkit/releases/download/v${KCODE_VERSION}/kcode.phar"
+          echo "${KCODE_SHA256}  kcode.phar" | sha256sum -c -
+          sudo install -m 0755 kcode.phar /usr/local/bin/kcode
+
+      - name: Install the toolchain pinned in devkit.php
+        run: kcode init
+
+      - name: The suites
+        run: composer test
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
